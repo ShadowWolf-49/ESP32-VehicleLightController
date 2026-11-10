@@ -1,0 +1,25 @@
+# Arduino IDE & CLI build folders
+build/
+
+# Compiled binaries and debug artifacts (from Sketch -> Export Compiled Binary)
+*.bin
+*.elf
+*.hex
+*.map
+*.eep
+*.lst
+*.sym
+*.lss
+
+# Arduino IDE 2.x local workspace & cache files
+.theia/
+.clangd/
+compile_commands.json
+
+# OS-generated hidden files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Optional: Local credentials file
+secrets.h
