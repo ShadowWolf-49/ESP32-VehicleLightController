@@ -95,6 +95,14 @@ Because the Aceirmc ESP32 8-Channel Relay board uses an external serial header r
 3. Select the correct COM port under **Tools > Port** and click **Upload** in the Arduino IDE.
 4. Press **`EN` (RESET)** once uploading finishes to boot the dual-core firmware.
 
+## Roadmap
+* Add running lights to turn on when Ignition is on
+* Add remote start features
+   * Input RPM readings to make sure running
+   * Use Second ESP-32 for remote start button
+       * Press and hold once / Start
+       * Press and hold again / Stop
+
 ## Automotive Safety Disclaimer
 
 > **WARNING:** Modifying vehicle lighting systems is subject to local, state, and federal road safety regulations (such as DOT/SAE or ECE standards). Ensure all custom lighting modes, strobes, and auxiliary light bars comply with local laws before operating on public roads. Always mount the relay board inside a non-conductive, vibration-resistant enclosure, install appropriate inline automotive fuses on all 12V supply lines, and verify fail-safe relay states before driving.
