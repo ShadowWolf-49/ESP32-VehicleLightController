@@ -97,6 +97,7 @@ Because the Aceirmc ESP32 8-Channel Relay board uses an external serial header r
 
 ## Roadmap
 * Add running lights to turn on when Ignition is on
+* Add OTA to web configuration
 * Add remote start features
    * Input RPM readings to make sure running
    * Use Second ESP-32 for remote start button
