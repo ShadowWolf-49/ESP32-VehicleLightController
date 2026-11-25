@@ -1,6 +1,7 @@
 #include "supervisor.h"
 #include "mpu_sensor.h"
 #include "web_portal.h"
+#include "inputs.h"
 #include <esp_sleep.h>
 #include <driver/gpio.h>
 #include <esp_task_wdt.h>
