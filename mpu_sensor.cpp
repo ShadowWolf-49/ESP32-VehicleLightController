@@ -448,10 +448,21 @@ void processVehicleTelemetry(void* pvParameters) {
   // Prevent startup delta-time explosion by seeding time-markers at task launch
   lastUpdateTime = millis();
 
+
   for (;;) { 
     // Feed watchdog before polling I2C bus
     esp_task_wdt_reset(); 
 
+      //keep feeding the WDT and yield without touching the I2C bus:
+      bool isCalibrating = false;
+      if (calibrationQueue != NULL) {
+        xQueuePeek(calibrationQueue, &isCalibrating, 0);
+      }
+      if (isCalibrating) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        continue;
+      }
+      
     if (mpuAvailable) {
       uint32_t now = millis();
       float dt = (now - lastUpdateTime) / 1000.0;

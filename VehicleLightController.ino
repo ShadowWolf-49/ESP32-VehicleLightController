@@ -50,7 +50,7 @@ void setup() {
   ignitionQueue      = xQueueCreate(1, sizeof(SignalCommand));
   hornQueue          = xQueueCreate(1, sizeof(bool));
   turnCancelQueue    = xQueueCreate(1, sizeof(SignalCommand));
-
+  calibrationQueue   = xQueueCreate(1, sizeof(bool));
   turnToBrakeQueue   = xQueueCreate(1, sizeof(SignalCommand));
   brakeToTurnQueue   = xQueueCreate(1, sizeof(SignalCommand));
   brakeToHazardQueue = xQueueCreate(1, sizeof(SignalCommand));
@@ -62,19 +62,21 @@ void setup() {
   SignalCommand initialBrake  = CMD_BRAKE_OFF;
   SignalCommand initialHazard = CMD_HAZARD_OFF;
   bool initialHornState       = false;
+  bool initialCalibState      = false;
 
   xQueueOverwrite(turnQueue, &initialTurn);
   xQueueOverwrite(brakeQueue, &initialBrake);
   xQueueOverwrite(hazardQueue, &initialHazard);
   xQueueOverwrite(hornQueue, &initialHornState);
   xQueueOverwrite(turnCancelQueue, &initialTurn);
-
+  xQueueOverwrite(calibrationQueue, &initialCalibState);
   xQueueOverwrite(turnToBrakeQueue, &initialTurn);
   xQueueOverwrite(brakeToTurnQueue, &initialBrake);
   xQueueOverwrite(brakeToHazardQueue, &initialBrake);
   xQueueOverwrite(hazardToBrakeQueue, &initialHazard);
   xQueueOverwrite(turnToHazardQueue, &initialTurn);
   xQueueOverwrite(hazardToTurnQueue, &initialHazard);
+
 
   // --- 2. HARDWARE IO PROVISIONING LAYER ---
   for (int i = 0; i < NUM_BUTTONS; i++) {
@@ -99,12 +101,6 @@ void setup() {
   // --- 3. BACKGROUND MULTI-TASKING SCHEDULER LAUNCH ---
   xTaskCreatePinnedToCore(processVehicleTelemetry, "processVehicleTelemetry", 3072, NULL, 1, &telemetryHandle, 1);
 
-  if (useIgnitionInterlock) {
-    xTaskCreatePinnedToCore(processSystemInterlockSupervisor, "supervisorTask", 2048, NULL, 3, NULL, 1);
-    Serial.println("[SETUP] Ignition Interlock Supervisor task pinned and launched on Core 1.");
-  } else {
-    Serial.println("[SETUP] Ignition Interlock disabled. System will remain permanently active.");
-  }
 
   xTaskCreatePinnedToCore(mainInputProcessorTask, "mainInputTask", 2048, NULL, 2, &inputTaskHandle, 1);
   xTaskCreatePinnedToCore(turnSignalTask, "turnSignalTask", 1536, NULL, 1, &turnTaskHandle, 0);
@@ -120,7 +116,7 @@ void setup() {
   }
 
   if (diagnosticsOn) {
-    xTaskCreatePinnedToCore(systemDiagnosticsTask, "diagnosticsTask", 2048, NULL, 0, NULL, 1);
+    xTaskCreatePinnedToCore(systemDiagnosticsTask, "diagnosticsTask", 2048, NULL, 0, &diagnosticsTaskHandle, 1);
     Serial.println("[SETUP] System diagnostics task successfully pinned and launched on Core 1.");
   } else {
     Serial.println("[SETUP] System diagnostics task disabled globally. Skipping runtime creation.");
@@ -128,8 +124,20 @@ void setup() {
 
   xTaskCreatePinnedToCore(core0WatchdogTask, "core0WdtTask", 2048, NULL, 1, &core0WdtHandle, 0);
   Serial.println("[SETUP] Core initialization sequences completed successfully. Relinquishing Arduino loop framework.");
-}
 
+  if (useIgnitionInterlock) {
+    xTaskCreatePinnedToCore(processSystemInterlockSupervisor, "supervisorTask", 3072, NULL, 3, NULL, 1);
+    Serial.println("[SETUP] Ignition Interlock Supervisor task pinned and launched on Core 1.");
+  } else {
+
+    // if not using IgnitionInterlock subscribe tasks to hardware watchdog
+    if (telemetryHandle != NULL) esp_task_wdt_add(telemetryHandle);
+    if (inputTaskHandle != NULL) esp_task_wdt_add(inputTaskHandle);
+    if (core0WdtHandle  != NULL) esp_task_wdt_add(core0WdtHandle);
+
+    Serial.println("[SETUP] Ignition Interlock disabled. System will remain permanently active.");
+  }
+}
 void loop() {
   vTaskDelay(pdMS_TO_TICKS(1000));
 }

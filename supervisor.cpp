@@ -2,6 +2,7 @@
 #include "mpu_sensor.h"
 #include "web_portal.h"
 #include <esp_sleep.h>
+#include <driver/gpio.h>
 #include <esp_task_wdt.h>
 
 /**
@@ -139,6 +140,7 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           if (inputTaskHandle  != NULL) vTaskResume(inputTaskHandle);
           if (hazardTaskHandle != NULL) vTaskResume(hazardTaskHandle);
           if (hornTaskHandle   != NULL) vTaskResume(hornTaskHandle);
+          if (diagnosticsTaskHandle != NULL) vTaskResume(diagnosticsTaskHandle);
           if (core0WdtHandle   != NULL) vTaskResume(core0WdtHandle);
 
           // Subscribe all resumed tasks to the Hardware Watchdog
@@ -162,10 +164,11 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           setTaskWdt(telemetryHandle, telemetryWdtActive, false);
 
           // Freeze background evaluation engines and telemetry loops to preserve vehicle battery
-          if (telemetryHandle != NULL) vTaskSuspend(telemetryHandle);
+          if (telemetryHandle  != NULL) vTaskSuspend(telemetryHandle);
           if (brakeTaskHandle  != NULL) vTaskSuspend(brakeTaskHandle);
           if (turnTaskHandle   != NULL) vTaskSuspend(turnTaskHandle);
           if (hornTaskHandle   != NULL) vTaskSuspend(hornTaskHandle);
+          if (diagnosticsTaskHandle != NULL) vTaskSuspend(diagnosticsTaskHandle);
 
           // Ensure human interface input loop stays alive on Core 1 to catch the hazard shutoff tap
           if (inputTaskHandle  != NULL) vTaskResume(inputTaskHandle);
@@ -207,6 +210,9 @@ void processSystemInterlockSupervisor(void* pvParameters) {
         case 3:
           Serial.println("[SUPERVISOR] Profile 3: Complete Idle. Commencing deep system shutdown...");
 
+          // Shut down Wi-Fi portal if it was still running when key turned off
+          stopWebPortal();
+
           // Unsubscribe all WDTs BEFORE suspending the tasks
           setTaskWdt(telemetryHandle, telemetryWdtActive, false);
           setTaskWdt(inputTaskHandle, inputWdtActive,     false);
@@ -220,6 +226,7 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           if (turnTaskHandle   != NULL) vTaskSuspend(turnTaskHandle);
           if (hazardTaskHandle != NULL) vTaskSuspend(hazardTaskHandle);
           if (hornTaskHandle   != NULL) vTaskSuspend(hornTaskHandle);
+          if (diagnosticsTaskHandle != NULL) vTaskSuspend(diagnosticsTaskHandle);
 
           // 2. Hardware Safety Isolation: Ground output channels to protect against continuous battery drain
           for (int i = 0; i < NUM_RELAYS; i++) {
@@ -248,15 +255,32 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           Serial.flush(); // Force serial buffer out before closing execution tracks
 
           // 5. ESP32 LIGHT SLEEP INTERLOCK PROVISIONING
-          // Configure wake anchors: System wakes up immediately on Ignition transition or Hazard switch toggle
-          esp_sleep_enable_ext0_wakeup((gpio_num_t)Ignition.value, 0); // Wake when Ignition goes LOW (Keyed ON)
-          esp_sleep_enable_ext1_wakeup(1ULL << Hazard.value, ESP_EXT1_WAKEUP_ALL_LOW ); //ESP_EXT1_WAKEUP_ANY_HIGH); // Wake when Hazard switch closes
+          // Detach edge ISRs so they do not conflict with level-triggered Light Sleep wakeup
+          detachInterrupt(digitalPinToInterrupt(Ignition.value));
+          detachInterrupt(digitalPinToInterrupt(Hazard.value));
 
-          // Go into light sleep. Execution stalls here until a wake hardware trigger event fires.
+          // Configure wake anchors: System wakes up immediately on Ignition transition or Hazard switch toggle
+          gpio_wakeup_enable((gpio_num_t)Ignition.value, GPIO_INTR_LOW_LEVEL); // Wake when Ignition goes LOW
+          gpio_wakeup_enable((gpio_num_t)Hazard.value,   GPIO_INTR_LOW_LEVEL); // Wake when Hazard goes LOW
+          esp_sleep_enable_gpio_wakeup();
+
+          // Enter Light Sleep (stalls CPU & timers here until GPIO 4 or GPIO 5 goes LOW)
           esp_light_sleep_start();
 
           // 6. POST-SLEEP RECOVERY INTERLOCK LOGIC
+          // Disable GPIO wakeup triggers so level interrupts don't re-fire during active runtime
+          gpio_wakeup_disable((gpio_num_t)Ignition.value);
+          gpio_wakeup_disable((gpio_num_t)Hazard.value);
           esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+          // Restore edge ISRs immediately so button release edges are captured
+          attachInterruptArg(digitalPinToInterrupt(Ignition.value), buttonISR, (void*)&Ignition, CHANGE);
+          attachInterruptArg(digitalPinToInterrupt(Hazard.value),   buttonISR, (void*)&Hazard,   CHANGE);
+
+          // Sync volatile ISR flags with current physical pin states after wake-up
+          Ignition.isPressed = (digitalRead(Ignition.value) == LOW);
+          Hazard.isPressed   = (digitalRead(Hazard.value)   == LOW);
+
           Serial.println("[SUPERVISOR] Core waking up from low power sleep track. Re-evaluating profiles...");
 
           // Wake inputTaskHandle so it can process the GPIO trigger and populate the queues!

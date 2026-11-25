@@ -547,7 +547,34 @@ void handleCalibratePage() {
   if (!mpuAvailable) {
     configServer.send(200, "text/html", buildConfigHTML("ERROR: MPU6050 sensor not detected on I2C bus."));
     return;
-  };
+  }
+
+  // Notify telemetry task to pause I2C polling via queue
+  bool calibState = true;
+  xQueueOverwrite(calibrationQueue, &calibState);
+  vTaskDelay(pdMS_TO_TICKS(15)); // Allow any active I2C read to complete
+
+  bool success = performSensorCalibration();
+
+  if (success) {
+    vehiclePitchRad       = staticMountPitchRad;
+    filteredVehicleAccelY = 0.0;
+    mpuBrakeActive        = false;
+    mpuBrakeCandidate     = false;
+    mpuEmergencyCandidate = false;
+    accumulatedYaw        = 0.0;
+    turnInitiated         = false;
+  }
+
+  // Resume telemetry I2C polling via queue
+  calibState = false;
+  xQueueOverwrite(calibrationQueue, &calibState);
+
+  if (success) {
+    configServer.send(200, "text/html", buildConfigHTML("SUCCESS: MPU6050 calibrated and saved to Flash!"));
+  } else {
+    configServer.send(200, "text/html", buildConfigHTML("ERROR: Calibration failed. Ensure vehicle is stationary."));
+  }
 }
 /**
   * @brief Serves the About and Hardware Pinout page.
@@ -555,7 +582,6 @@ void handleCalibratePage() {
 void handleAboutPage() {
   configServer.send(200, "text/html", buildAboutHTML());
 }
-
 /**
   * @brief Serves the live system diagnostics page.
   */

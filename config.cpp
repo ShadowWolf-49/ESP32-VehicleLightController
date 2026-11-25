@@ -95,7 +95,7 @@ QueueHandle_t hazardQueue        = NULL;
 QueueHandle_t ignitionQueue      = NULL;
 QueueHandle_t hornQueue          = NULL;
 QueueHandle_t turnCancelQueue    = NULL;
-
+QueueHandle_t calibrationQueue   = NULL;
 QueueHandle_t turnToBrakeQueue   = NULL;
 QueueHandle_t brakeToTurnQueue   = NULL;
 QueueHandle_t brakeToHazardQueue = NULL;
@@ -111,6 +111,7 @@ TaskHandle_t inputTaskHandle     = NULL;
 TaskHandle_t hazardTaskHandle    = NULL;
 TaskHandle_t hornTaskHandle      = NULL;
 TaskHandle_t webPortalTaskHandle = NULL;
+TaskHandle_t diagnosticsTaskHandle = NULL;
 TaskHandle_t core0WdtHandle      = NULL;
 
 // Global Mode Trackers

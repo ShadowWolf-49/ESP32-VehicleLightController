@@ -165,6 +165,7 @@ extern QueueHandle_t hazardQueue;
 extern QueueHandle_t ignitionQueue;
 extern QueueHandle_t hornQueue;
 extern QueueHandle_t turnCancelQueue;
+extern QueueHandle_t calibrationQueue;
 
 extern QueueHandle_t turnToBrakeQueue;
 extern QueueHandle_t brakeToTurnQueue;
@@ -181,6 +182,7 @@ extern TaskHandle_t inputTaskHandle;
 extern TaskHandle_t hazardTaskHandle;
 extern TaskHandle_t hornTaskHandle;
 extern TaskHandle_t webPortalTaskHandle;
+extern TaskHandle_t diagnosticsTaskHandle;
 extern TaskHandle_t core0WdtHandle;
 
 // Global Mode Trackers
