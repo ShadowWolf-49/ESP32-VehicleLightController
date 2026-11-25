@@ -20,6 +20,9 @@ void setup() {
     relays[i]->isOn = false;
   }
 
+  // FAIL-SAFE SHUTDOWN GUARD:  Immediately force all relay pins LOW on clean shutdown
+  esp_register_shutdown_handler(groundAllRelaysFailSafe);
+
   // Initialize Hardware Task Watchdog (3-second timeout, panic/reboot enabled)
   esp_task_wdt_config_t wdtConfig = {
     .timeout_ms     = WDT_TIMEOUT_SEC * 1000,
@@ -46,6 +49,7 @@ void setup() {
   hazardQueue        = xQueueCreate(1, sizeof(SignalCommand));
   ignitionQueue      = xQueueCreate(1, sizeof(SignalCommand));
   hornQueue          = xQueueCreate(1, sizeof(bool));
+  turnCancelQueue    = xQueueCreate(1, sizeof(SignalCommand));
 
   turnToBrakeQueue   = xQueueCreate(1, sizeof(SignalCommand));
   brakeToTurnQueue   = xQueueCreate(1, sizeof(SignalCommand));
@@ -63,6 +67,7 @@ void setup() {
   xQueueOverwrite(brakeQueue, &initialBrake);
   xQueueOverwrite(hazardQueue, &initialHazard);
   xQueueOverwrite(hornQueue, &initialHornState);
+  xQueueOverwrite(turnCancelQueue, &initialTurn);
 
   xQueueOverwrite(turnToBrakeQueue, &initialTurn);
   xQueueOverwrite(brakeToTurnQueue, &initialBrake);
@@ -92,7 +97,7 @@ void setup() {
   startWebPortal();
 
   // --- 3. BACKGROUND MULTI-TASKING SCHEDULER LAUNCH ---
-  xTaskCreate(processVehicleTelemetry, "processVehicleTelemetry", 3072, NULL, 1, &telemetryHandle);
+  xTaskCreatePinnedToCore(processVehicleTelemetry, "processVehicleTelemetry", 3072, NULL, 1, &telemetryHandle, 1);
 
   if (useIgnitionInterlock) {
     xTaskCreatePinnedToCore(processSystemInterlockSupervisor, "supervisorTask", 2048, NULL, 3, NULL, 1);
@@ -121,7 +126,7 @@ void setup() {
     Serial.println("[SETUP] System diagnostics task disabled globally. Skipping runtime creation.");
   }
 
-  xTaskCreatePinnedToCore(core0WatchdogTask, "core0WdtTask", 1024, NULL, 1, &core0WdtHandle, 0);
+  xTaskCreatePinnedToCore(core0WatchdogTask, "core0WdtTask", 2048, NULL, 1, &core0WdtHandle, 0);
   Serial.println("[SETUP] Core initialization sequences completed successfully. Relinquishing Arduino loop framework.");
 }
 

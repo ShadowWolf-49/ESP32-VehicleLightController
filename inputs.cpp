@@ -17,7 +17,7 @@ void IRAM_ATTR buttonISR(void* arg) {
 
   // --- 1. HARDWARE SWITCH DEBOUNCE INTERLOCK ---
   // Early exit if the incoming edge falls within the rapid lockout bounce frame window
-  if (now - btn->pressStartTime < DEBOUNCE_LOCKOUT) {
+  if (now - btn->lastEdgeTime < DEBOUNCE_LOCKOUT) {
     return;
   }
 
@@ -27,14 +27,14 @@ void IRAM_ATTR buttonISR(void* arg) {
     // Falling Edge Transition: Mechanical contact achieved (Active-LOW switch pulling trace down)
     if (!btn->isPressed) { 
       btn->isPressed      = true;
-      btn->pressStartTime = now;
+      btn->lastEdgeTime = now;
       btn->eventTriggered = false; // Reset trigger tracking engine flags for fresh evaluation loops
     }
   } else {
     // Rising Edge Transition: Mechanical contact released (Pull-up resistor snapping trace high)
     if (btn->isPressed) {
       btn->isPressed      = false;
-      btn->pressStartTime = now;
+      btn->lastEdgeTime = now;
     }
   }
 }
@@ -93,6 +93,15 @@ void processTurnSignalButtons() {
   // Parallel structural translation maps pairing physical addresses to state directives
   Button* turnButtons[2]       = {&Left, &Right};
   SignalCommand triggerCmds[2] = {CMD_LEFT, CMD_RIGHT};
+
+  // --- 0. CHECK FOR CORE 0 TIMEOUT CANCELLATIONS ---
+  SignalCommand cancelCmd;
+  if (xQueueReceive(turnCancelQueue, &cancelCmd, 0) == pdTRUE) {
+    if (cancelCmd == CMD_TURN_OFF) {
+      signalMode = CMD_TURN_OFF;
+      Serial.println("[INPUT] Synced signalMode to OFF from Core 0 timeout");
+    }
+  }
 
   // Iterate symmetrically over independent signaling channels
   for (int i = 0; i < 2; i++) {
@@ -281,7 +290,6 @@ void processPortalComboButton() {
   * @param pvParameters Standard untyped FreeRTOS task argument block pointer (Unused).
   */
 void mainInputProcessorTask(void* pvParameters) {
-  esp_task_wdt_add(NULL); // Subscribe Core 1 Input Task to Hardware Watchdog
   uint32_t waitTime = 15;
   bool ignitionOn = false;
   for (;;) {

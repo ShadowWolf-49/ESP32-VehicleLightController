@@ -94,6 +94,7 @@ QueueHandle_t turnQueue          = NULL;
 QueueHandle_t hazardQueue        = NULL;
 QueueHandle_t ignitionQueue      = NULL;
 QueueHandle_t hornQueue          = NULL;
+QueueHandle_t turnCancelQueue    = NULL;
 
 QueueHandle_t turnToBrakeQueue   = NULL;
 QueueHandle_t brakeToTurnQueue   = NULL;

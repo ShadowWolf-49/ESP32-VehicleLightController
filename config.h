@@ -34,17 +34,18 @@ struct Button {
   const uint8_t value;
   volatile bool isPressed = false;
   volatile bool eventTriggered = false;
-  volatile uint32_t pressStartTime = 0;
+  uint32_t lastEdgeTime = 0;          // Exclusive to buttonISR (debounce)
+  uint32_t pressStartTime = 0;        // Exclusive to Core 1 (hold duration)
 
   operator uint8_t() const { return value; }
   operator bool() const volatile { return isPressed; }
   Button& operator=(const Button&) = delete;
 
-  volatile Button& operator=(bool state) volatile {
+  bool operator=(bool state) volatile {
     if (isPressed != state) {
       isPressed = state;
     }
-    return *this;
+    return isPressed;
   }
 };
 
@@ -56,12 +57,12 @@ struct Relay {
   operator bool() const volatile { return isOn; }
   Relay& operator=(const Relay&) = delete;
 
-  volatile Relay& operator=(bool state) volatile {
+  bool operator=(bool state) volatile {
     if (isOn != state) {
       isOn = state;
       digitalWrite(value, isOn ? HIGH : LOW);
     }
-    return *this;
+    return isOn;
   }
 };
 
@@ -163,6 +164,7 @@ extern QueueHandle_t turnQueue;
 extern QueueHandle_t hazardQueue;
 extern QueueHandle_t ignitionQueue;
 extern QueueHandle_t hornQueue;
+extern QueueHandle_t turnCancelQueue;
 
 extern QueueHandle_t turnToBrakeQueue;
 extern QueueHandle_t brakeToTurnQueue;

@@ -444,10 +444,7 @@ void updateMPUTurnDetection(float correctedGyroZ, float dt) {
   * 
   * @param pvParameters Standard untyped FreeRTOS task argument block pointer (Unused).
   */
-void processVehicleTelemetry(void* pvParameters) {
-  // Subscribe Core 1 Telemetry Task to Hardware Watchdog
-  esp_task_wdt_add(NULL); 
-  
+void processVehicleTelemetry(void* pvParameters) {  
   // Prevent startup delta-time explosion by seeding time-markers at task launch
   lastUpdateTime = millis();
 

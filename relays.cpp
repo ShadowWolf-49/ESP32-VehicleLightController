@@ -1,12 +1,17 @@
 #include "relays.h"
 #include <esp_task_wdt.h>
 
+// Runs automatically inside the WDT interrupt right before panic/reboot
+extern "C" void IRAM_ATTR esp_task_wdt_isr_user_handler(void) {
+  groundAllRelaysFailSafe();
+}
+
 /**
   * @brief Immediately grounds all physical relay outputs to a safe LOW state.
   */
-void groundAllRelaysFailSafe() {
+void IRAM_ATTR groundAllRelaysFailSafe() {
   for (int i = 0; i < NUM_RELAYS; i++) {
-    digitalWrite(relays[i]->value, LOW);
+    gpio_set_level((gpio_num_t)relays[i]->value, 0);
     relays[i]->isOn = false;
   }
 }
@@ -40,7 +45,7 @@ void brakeLightTask(void* pvParameters) {
     * - When IDLE (!brakeActive), block indefinitely (portMAX_DELAY) to reduce CPU load to 0%.
     * - When ACTIVE (brakeActive), poll instantly (0-timeout) to allow flasher clocks to cycle.
     */
-    uint32_t waitTime = (!brakeActive) ? portMAX_DELAY : 0;
+    uint32_t waitTime = (!brakeActive && currentHazardMode != CMD_HAZARD) ? portMAX_DELAY : 0;
 
     // 1. INBOUND QUEUE DATA ACQUISITION
     if (xQueueReceive(brakeQueue, &incomingCmd, waitTime) == pdPASS) { 
@@ -228,6 +233,10 @@ void turnSignalTask(void* pvParameters) {
         bool brakeActive = (currentBrakeMode == CMD_BRAKE || currentBrakeMode == CMD_EMERGENCY_BRAKE || Brake.isPressed);
         BackLeft   = brakeActive;
         BackRight  = brakeActive;
+
+        // Notify Core 1 that the turn signal timed out
+        SignalCommand cancelCmd = CMD_TURN_OFF;
+        xQueueOverwrite(turnCancelQueue, &cancelCmd);
       } 
       
       // TIMING CADENCE SWITCH: Toggle physical trace footprints once interval parameters are achieved
@@ -328,7 +337,7 @@ void hazardTask(void* pvParameters) {
         * or the blinker-low release window based on brakeHazardPercent configuration maps.
         */
         uint32_t currentPosition = (millis() - flashTimer);
-        uint32_t highWindowLimit = (hazardFlashInterval * brakeHazardPercent) / 100.0;
+        uint32_t highWindowLimit = (uint32_t)((hazardFlashInterval * brakeHazardPercent) / 100.0f);
         bool brakeDutyCycleHigh  = (currentPosition < highWindowLimit);
 
         if (brakeDutyCycleHigh) {
@@ -350,7 +359,22 @@ void hazardTask(void* pvParameters) {
         BackLeft   = hazardToggle;
         BackRight  = hazardToggle;
       }
-    } 
+    }
+
+    // --- 3B. CLEAN HANDOFF / RELEASE LAYER WHEN HAZARDS TURN OFF ---
+    else {
+      // Drop front markers if no turn signal is actively claiming them
+
+      if (currentTurnMode != CMD_LEFT)  FrontLeft  = false;
+      if (currentTurnMode != CMD_RIGHT) FrontRight = false;
+
+      // Drop rear markers if neither a turn signal nor brake is actively claiming them
+      bool isBraking = (currentBrakeMode == CMD_BRAKE || currentBrakeMode == CMD_EMERGENCY_BRAKE);
+      if (!isBraking) {
+        if (currentTurnMode != CMD_LEFT)  BackLeft  = false;
+        if (currentTurnMode != CMD_RIGHT) BackRight = false;
+      }
+    }
     
     // --- 4. DATA SYNCHRONIZATION BACKPLANE DISTRIBUTION ---
     // Overwrite shared loop registers so Brake and Turn engines yield hardware priority gracefully

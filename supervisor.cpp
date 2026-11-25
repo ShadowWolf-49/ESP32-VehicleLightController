@@ -29,6 +29,23 @@ void processSystemInterlockSupervisor(void* pvParameters) {
   ignitionMode = CMD_IGNITION_OFF;
   SignalCommand currentHazardMode = CMD_HAZARD_OFF;
 
+  // Tracks watchdog subscription
+  bool telemetryWdtActive = false;
+  bool inputWdtActive     = false;
+  bool core0WdtActive     = false;
+
+  // HELPER LAMBDA for watchdog events
+  auto setTaskWdt = [](TaskHandle_t handle, bool& isActive, bool enable) {
+    if (handle == NULL) return;
+    if (enable && !isActive) {
+      esp_task_wdt_add(handle);
+      isActive = true;
+    } else if (!enable && isActive) {
+      esp_task_wdt_delete(handle);
+      isActive = false;
+    }
+  };
+
   for (;;) {
 
     // 1. DATA PIPELINE ACQUISITION LAYER
@@ -116,22 +133,18 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           }
 
           // Thread Recovery Routine: Un-suspend tasks across both processing cores
-          if (telemetryHandle  != NULL) {
-            vTaskResume(telemetryHandle);
-            esp_task_wdt_add(telemetryHandle); // Re-subscribe to Hardware Watchdog
-          }
+          if (telemetryHandle  != NULL) vTaskResume(telemetryHandle);
           if (brakeTaskHandle  != NULL) vTaskResume(brakeTaskHandle);
           if (turnTaskHandle   != NULL) vTaskResume(turnTaskHandle);
-          if (inputTaskHandle  != NULL) {
-            vTaskResume(inputTaskHandle);
-            esp_task_wdt_add(inputTaskHandle); // Re-subscribe to Hardware Watchdog
-          }
+          if (inputTaskHandle  != NULL) vTaskResume(inputTaskHandle);
           if (hazardTaskHandle != NULL) vTaskResume(hazardTaskHandle);
           if (hornTaskHandle   != NULL) vTaskResume(hornTaskHandle);
-          if (core0WdtHandle   != NULL) {
-            vTaskResume(core0WdtHandle);
-            esp_task_wdt_add(core0WdtHandle);  // Re-subscribe Core 0 heartbeat
-          }
+          if (core0WdtHandle   != NULL) vTaskResume(core0WdtHandle);
+
+          // Subscribe all resumed tasks to the Hardware Watchdog
+          setTaskWdt(telemetryHandle, telemetryWdtActive, true);
+          setTaskWdt(inputTaskHandle, inputWdtActive,     true);
+          setTaskWdt(core0WdtHandle,  core0WdtActive,     true);
 
           Serial.println("[SUPERVISOR] All telemetry, signal, and driver loops fully operational.");
           break;
@@ -145,24 +158,18 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           // Shut down Wi-Fi portal if it was still running when key turned off
           stopWebPortal();
 
+          // Unsubscribe telemetry WDT BEFORE suspending the task
+          setTaskWdt(telemetryHandle, telemetryWdtActive, false);
+
           // Freeze background evaluation engines and telemetry loops to preserve vehicle battery
-          if (telemetryHandle != NULL) {
-            esp_task_wdt_delete(telemetryHandle);
-            vTaskSuspend(telemetryHandle);
-          }
+          if (telemetryHandle != NULL) vTaskSuspend(telemetryHandle);
           if (brakeTaskHandle  != NULL) vTaskSuspend(brakeTaskHandle);
           if (turnTaskHandle   != NULL) vTaskSuspend(turnTaskHandle);
           if (hornTaskHandle   != NULL) vTaskSuspend(hornTaskHandle);
 
           // Ensure human interface input loop stays alive on Core 1 to catch the hazard shutoff tap
-          if (inputTaskHandle  != NULL) {
-            vTaskResume(inputTaskHandle);
-            esp_task_wdt_add(inputTaskHandle);
-          }
-          if (core0WdtHandle   != NULL) {
-            vTaskResume(core0WdtHandle);
-            esp_task_wdt_add(core0WdtHandle);
-          }
+          if (inputTaskHandle  != NULL) vTaskResume(inputTaskHandle);
+          if (core0WdtHandle   != NULL) vTaskResume(core0WdtHandle);
           if (hazardTaskHandle != NULL) vTaskResume(hazardTaskHandle);
 
           // Flush volatile turn and brake variables down to safe default definitions
@@ -182,11 +189,16 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           BackLeft   = false;
           BackRight  = false;
 
+          // Subscribe all resumed tasks to the Hardware Watchdog
+          setTaskWdt(inputTaskHandle, inputWdtActive, true);
+          setTaskWdt(core0WdtHandle,  core0WdtActive, true);
+
           // Put the MPU6050 chip into low-power register standby since tracking is disabled
           if (mpuAvailable) {
             mpu.enableSleep(true); // Halt sensor data recording
             Serial.println("[SUPERVISOR] MPU6050 placed into low-power mode. Hazard engine running isolated.");
           }
+
           break;
 
         // ==========================================================================
@@ -195,19 +207,15 @@ void processSystemInterlockSupervisor(void* pvParameters) {
         case 3:
           Serial.println("[SUPERVISOR] Profile 3: Complete Idle. Commencing deep system shutdown...");
 
+          // Unsubscribe all WDTs BEFORE suspending the tasks
+          setTaskWdt(telemetryHandle, telemetryWdtActive, false);
+          setTaskWdt(inputTaskHandle, inputWdtActive,     false);
+          setTaskWdt(core0WdtHandle,  core0WdtActive,     false);
+
           // 1. Thread Teardown Strategy: Suspend processing loops across both execution cores
-          if (telemetryHandle != NULL) {
-            esp_task_wdt_delete(telemetryHandle);
-            vTaskSuspend(telemetryHandle);
-          }
-          if (inputTaskHandle != NULL) {
-            esp_task_wdt_delete(inputTaskHandle);
-            vTaskSuspend(inputTaskHandle);
-          }
-          if (core0WdtHandle != NULL) {
-            esp_task_wdt_delete(core0WdtHandle);
-            vTaskSuspend(core0WdtHandle);
-          }
+          if (telemetryHandle != NULL) vTaskSuspend(telemetryHandle);
+          if (inputTaskHandle != NULL)  vTaskSuspend(inputTaskHandle);
+          if (core0WdtHandle != NULL) vTaskSuspend(core0WdtHandle);
           if (brakeTaskHandle  != NULL) vTaskSuspend(brakeTaskHandle);
           if (turnTaskHandle   != NULL) vTaskSuspend(turnTaskHandle);
           if (hazardTaskHandle != NULL) vTaskSuspend(hazardTaskHandle);
@@ -248,9 +256,15 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           esp_light_sleep_start();
 
           // 6. POST-SLEEP RECOVERY INTERLOCK LOGIC
-          // Clear sleep parameters cleanly immediately upon recovery to pass authority back to the loop
           esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
           Serial.println("[SUPERVISOR] Core waking up from low power sleep track. Re-evaluating profiles...");
+
+          // Wake inputTaskHandle so it can process the GPIO trigger and populate the queues!
+          if (inputTaskHandle != NULL) {
+            vTaskResume(inputTaskHandle);
+            setTaskWdt(inputTaskHandle, inputWdtActive, true);
+          }
+          vTaskDelay(pdMS_TO_TICKS(25)); // Give Core 1 input task one cycle to read pins & post to queues
           break;
       }
     }
@@ -312,8 +326,6 @@ void systemDiagnosticsTask(void* pvParameters) {
   * @param pvParameters Standard untyped FreeRTOS task argument block pointer (Unused).
   */
 void core0WatchdogTask(void* pvParameters) {
-  esp_task_wdt_add(NULL); // Subscribe this Core 0 task to the TWDT
-
   for (;;) {
     esp_task_wdt_reset(); // Feed the hardware watchdog
     vTaskDelay(pdMS_TO_TICKS(500));
