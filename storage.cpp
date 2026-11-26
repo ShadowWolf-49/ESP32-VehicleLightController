@@ -4,63 +4,64 @@
    * @brief Commits all current runtime configuration settings to ESP32 Flash (NVS).
    */
 void saveSystemConfig() {
-  prefs.begin("SysConfig", false); // Open in Read/Write mode
+  Preferences sysPrefs; // Local instance prevents NVS collisions
+  sysPrefs.begin("SysConfig", false); // Open in Read only mode
 
   // Normal Booleans & Timing
-  prefs.putUInt("debounce",     DEBOUNCE_LOCKOUT);
-  prefs.putBool("ignInterlock", useIgnitionInterlock);
-  prefs.putBool("diagOn",       diagnosticsOn);
-  prefs.putBool("useBrake",     useBrakelights);
-  prefs.putBool("useMpuBrake",  useMPUBrake);
-  prefs.putBool("useMpuTurn",   useMPUTurnSignal);
+  sysPrefs.putUInt("debounce",     DEBOUNCE_LOCKOUT);
+  sysPrefs.putBool("ignInterlock", useIgnitionInterlock);
+  sysPrefs.putBool("diagOn",       diagnosticsOn);
+  sysPrefs.putBool("useBrake",     useBrakelights);
+  sysPrefs.putBool("useMpuBrake",  useMPUBrake);
+  sysPrefs.putBool("useMpuTurn",   useMPUTurnSignal);
 
   // Brake-light variables
-  prefs.putUInt("brkFlashInt",  brakeFlashInterval);
-  prefs.putUInt("brkFlashDur",  brakeFlashDuration);
-  prefs.putUInt("emgFlashInt",  EmergencyFlashInterval);
-  prefs.putUInt("emgFlashDur",  EmergencyFlashDuration);
+  sysPrefs.putUInt("brkFlashInt",  brakeFlashInterval);
+  sysPrefs.putUInt("brkFlashDur",  brakeFlashDuration);
+  sysPrefs.putUInt("emgFlashInt",  EmergencyFlashInterval);
+  sysPrefs.putUInt("emgFlashDur",  EmergencyFlashDuration);
 
   // Turn-signal variables
-  prefs.putUInt("blkFlashInt",  blinkFlashInterval);
-  prefs.putUInt("holdDurTurn",  HoldDurationTurning);
-  prefs.putUInt("holdDurInf",   HoldDurationInfinite);
-  prefs.putUInt("durLaneChg",   DurationLaneChange);
-  prefs.putUInt("flashDurTurn", FlashDurationTurning);
+  sysPrefs.putUInt("blkFlashInt",  blinkFlashInterval);
+  sysPrefs.putUInt("holdDurTurn",  HoldDurationTurning);
+  sysPrefs.putUInt("holdDurInf",   HoldDurationInfinite);
+  sysPrefs.putUInt("durLaneChg",   DurationLaneChange);
+  sysPrefs.putUInt("flashDurTurn", FlashDurationTurning);
 
   // Hazard variables
-  prefs.putUInt("hazFlashInt",  hazardFlashInterval);
-  prefs.putFloat("brkHazPct",   brakeHazardPercent);
+  sysPrefs.putUInt("hazFlashInt",  hazardFlashInterval);
+  sysPrefs.putFloat("brkHazPct",   brakeHazardPercent);
 
   // MPU6050 calibration variables
-  prefs.putInt("samples",       samples);
-  prefs.putFloat("minMountX",   MIN_MOUNT_ANGLE_X);
-  prefs.putFloat("maxMountX",   MAX_MOUNT_ANGLE_X);
-  prefs.putFloat("vehYDir",     VEHICLE_Y_DIRECTION);
+  sysPrefs.putInt("samples",       samples);
+  sysPrefs.putFloat("minMountX",   MIN_MOUNT_ANGLE_X);
+  sysPrefs.putFloat("maxMountX",   MAX_MOUNT_ANGLE_X);
+  sysPrefs.putFloat("vehYDir",     VEHICLE_Y_DIRECTION);
 
   // MPU6050 filtering
-  prefs.putFloat("accelAlpha",  MPU_ACCEL_FILTER_ALPHA);
-  prefs.putFloat("compAlpha",   alpha);
+  sysPrefs.putFloat("accelAlpha",  MPU_ACCEL_FILTER_ALPHA);
+  sysPrefs.putFloat("compAlpha",   alpha);
 
   // MPU6050 normal brake detection
-  prefs.putFloat("brkOnThresh", MPU_BRAKE_ON_THRESHOLD);
-  prefs.putFloat("brkOffThres", MPU_BRAKE_OFF_THRESHOLD);
-  prefs.putUInt("brkConfMs",    MPU_BRAKE_CONFIRM_MS);
-  prefs.putUInt("brkRelMs",     MPU_BRAKE_RELEASE_MS);
+  sysPrefs.putFloat("brkOnThresh", MPU_BRAKE_ON_THRESHOLD);
+  sysPrefs.putFloat("brkOffThres", MPU_BRAKE_OFF_THRESHOLD);
+  sysPrefs.putUInt("brkConfMs",    MPU_BRAKE_CONFIRM_MS);
+  sysPrefs.putUInt("brkRelMs",     MPU_BRAKE_RELEASE_MS);
 
   // MPU6050 emergency brake detection
-  prefs.putFloat("emgThresh",   MPU_EMERGENCY_THRESHOLD);
-  prefs.putUInt("emgConfMs",    MPU_EMERGENCY_CONFIRM_MS);
+  sysPrefs.putFloat("emgThresh",   MPU_EMERGENCY_THRESHOLD);
+  sysPrefs.putUInt("emgConfMs",    MPU_EMERGENCY_CONFIRM_MS);
 
   // MPU6050 turn-signal
-  prefs.putFloat("yawCancel",   YAW_CANCEL_THRESHOLD);
+  sysPrefs.putFloat("yawCancel",   YAW_CANCEL_THRESHOLD);
 
   // Wi-Fi Portal settings
-  prefs.putString("apSsid",     AP_SSID);
-  prefs.putString("apPass",     AP_PASS);
-  prefs.putUInt("portalTime",   PORTAL_TIMEOUT_MS);
+  sysPrefs.putString("apSsid",     AP_SSID);
+  sysPrefs.putString("apPass",     AP_PASS);
+  sysPrefs.putUInt("portalTime",   PORTAL_TIMEOUT_MS);
 
-  prefs.putBool("cfgInit",      true); // Mark flash configuration as initialized
-  prefs.end();
+  sysPrefs.putBool("cfgInit",      true); // Mark flash configuration as initialized
+  sysPrefs.end();
 
   Serial.println("[CONFIG] System configuration parameters saved to NVS flash.");
 }
@@ -69,69 +70,70 @@ void saveSystemConfig() {
   * If flash is empty (first boot), writes the default variables to Flash.
   */
 void loadSystemConfig() {
-  prefs.begin("SysConfig", false);
+  Preferences sysPrefs; // Local instance prevents NVS collisions
+  sysPrefs.begin("SysConfig", false);
 
-  if (!prefs.getBool("cfgInit", false)) {
-    prefs.end();
+  if (!sysPrefs.getBool("cfgInit", false)) {
+    sysPrefs.end();
     Serial.println("[CONFIG] No saved configuration found in Flash. Writing defaults...");
     saveSystemConfig();
     return;
   }
 
   // Normal Booleans & Timing
-  DEBOUNCE_LOCKOUT        = prefs.getUInt("debounce",     DEBOUNCE_LOCKOUT);
-  useIgnitionInterlock    = prefs.getBool("ignInterlock", useIgnitionInterlock);
-  diagnosticsOn           = prefs.getBool("diagOn",       diagnosticsOn);
-  useBrakelights          = prefs.getBool("useBrake",     useBrakelights);
-  useMPUBrake             = prefs.getBool("useMpuBrake",  useMPUBrake);
-  useMPUTurnSignal        = prefs.getBool("useMpuTurn",   useMPUTurnSignal);
+  DEBOUNCE_LOCKOUT        = sysPrefs.getUInt("debounce",     DEBOUNCE_LOCKOUT);
+  useIgnitionInterlock    = sysPrefs.getBool("ignInterlock", useIgnitionInterlock);
+  diagnosticsOn           = sysPrefs.getBool("diagOn",       diagnosticsOn);
+  useBrakelights          = sysPrefs.getBool("useBrake",     useBrakelights);
+  useMPUBrake             = sysPrefs.getBool("useMpuBrake",  useMPUBrake);
+  useMPUTurnSignal        = sysPrefs.getBool("useMpuTurn",   useMPUTurnSignal);
 
   // Brake-light variables
-  brakeFlashInterval      = prefs.getUInt("brkFlashInt",  brakeFlashInterval);
-  brakeFlashDuration      = prefs.getUInt("brkFlashDur",  brakeFlashDuration);
-  EmergencyFlashInterval  = prefs.getUInt("emgFlashInt",  EmergencyFlashInterval);
-  EmergencyFlashDuration  = prefs.getUInt("emgFlashDur",  EmergencyFlashDuration);
+  brakeFlashInterval      = sysPrefs.getUInt("brkFlashInt",  brakeFlashInterval);
+  brakeFlashDuration      = sysPrefs.getUInt("brkFlashDur",  brakeFlashDuration);
+  EmergencyFlashInterval  = sysPrefs.getUInt("emgFlashInt",  EmergencyFlashInterval);
+  EmergencyFlashDuration  = sysPrefs.getUInt("emgFlashDur",  EmergencyFlashDuration);
 
   // Turn-signal variables
-  blinkFlashInterval      = prefs.getUInt("blkFlashInt",  blinkFlashInterval);
-  HoldDurationTurning     = prefs.getUInt("holdDurTurn",  HoldDurationTurning);
-  HoldDurationInfinite    = prefs.getUInt("holdDurInf",   HoldDurationInfinite);
-  DurationLaneChange      = prefs.getUInt("durLaneChg",   DurationLaneChange);
-  FlashDurationTurning    = prefs.getUInt("flashDurTurn", FlashDurationTurning);
+  blinkFlashInterval      = sysPrefs.getUInt("blkFlashInt",  blinkFlashInterval);
+  HoldDurationTurning     = sysPrefs.getUInt("holdDurTurn",  HoldDurationTurning);
+  HoldDurationInfinite    = sysPrefs.getUInt("holdDurInf",   HoldDurationInfinite);
+  DurationLaneChange      = sysPrefs.getUInt("durLaneChg",   DurationLaneChange);
+  FlashDurationTurning    = sysPrefs.getUInt("flashDurTurn", FlashDurationTurning);
 
   // Hazard variables
-  hazardFlashInterval     = prefs.getUInt("hazFlashInt",  hazardFlashInterval);
-  brakeHazardPercent      = prefs.getFloat("brkHazPct",   brakeHazardPercent);
+  hazardFlashInterval     = sysPrefs.getUInt("hazFlashInt",  hazardFlashInterval);
+  brakeHazardPercent      = sysPrefs.getFloat("brkHazPct",   brakeHazardPercent);
 
   // MPU6050 calibration variables
-  samples                 = prefs.getInt("samples",       samples);
-  MIN_MOUNT_ANGLE_X       = prefs.getFloat("minMountX",   MIN_MOUNT_ANGLE_X);
-  MAX_MOUNT_ANGLE_X       = prefs.getFloat("maxMountX",   MAX_MOUNT_ANGLE_X);
-  VEHICLE_Y_DIRECTION     = prefs.getFloat("vehYDir",     VEHICLE_Y_DIRECTION);
+  samples                 = sysPrefs.getInt("samples",       samples);
+  MIN_MOUNT_ANGLE_X       = sysPrefs.getFloat("minMountX",   MIN_MOUNT_ANGLE_X);
+  MAX_MOUNT_ANGLE_X       = sysPrefs.getFloat("maxMountX",   MAX_MOUNT_ANGLE_X);
+  VEHICLE_Y_DIRECTION     = sysPrefs.getFloat("vehYDir",     VEHICLE_Y_DIRECTION);
 
   // MPU6050 filtering
-  MPU_ACCEL_FILTER_ALPHA  = prefs.getFloat("accelAlpha",  MPU_ACCEL_FILTER_ALPHA);
-  alpha                   = prefs.getFloat("compAlpha",   alpha);
+  MPU_ACCEL_FILTER_ALPHA  = sysPrefs.getFloat("accelAlpha",  MPU_ACCEL_FILTER_ALPHA);
+  alpha                   = sysPrefs.getFloat("compAlpha",   alpha);
 
   // MPU6050 normal brake detection
-  MPU_BRAKE_ON_THRESHOLD  = prefs.getFloat("brkOnThresh", MPU_BRAKE_ON_THRESHOLD);
-  MPU_BRAKE_OFF_THRESHOLD = prefs.getFloat("brkOffThres", MPU_BRAKE_OFF_THRESHOLD);
-  MPU_BRAKE_CONFIRM_MS    = prefs.getUInt("brkConfMs",    MPU_BRAKE_CONFIRM_MS);
-  MPU_BRAKE_RELEASE_MS    = prefs.getUInt("brkRelMs",     MPU_BRAKE_RELEASE_MS);
+  MPU_BRAKE_ON_THRESHOLD  = sysPrefs.getFloat("brkOnThresh", MPU_BRAKE_ON_THRESHOLD);
+  MPU_BRAKE_OFF_THRESHOLD = sysPrefs.getFloat("brkOffThres", MPU_BRAKE_OFF_THRESHOLD);
+  MPU_BRAKE_CONFIRM_MS    = sysPrefs.getUInt("brkConfMs",    MPU_BRAKE_CONFIRM_MS);
+  MPU_BRAKE_RELEASE_MS    = sysPrefs.getUInt("brkRelMs",     MPU_BRAKE_RELEASE_MS);
 
   // MPU6050 emergency brake detection
-  MPU_EMERGENCY_THRESHOLD = prefs.getFloat("emgThresh",   MPU_EMERGENCY_THRESHOLD);
-  MPU_EMERGENCY_CONFIRM_MS= prefs.getUInt("emgConfMs",    MPU_EMERGENCY_CONFIRM_MS);
+  MPU_EMERGENCY_THRESHOLD = sysPrefs.getFloat("emgThresh",   MPU_EMERGENCY_THRESHOLD);
+  MPU_EMERGENCY_CONFIRM_MS= sysPrefs.getUInt("emgConfMs",    MPU_EMERGENCY_CONFIRM_MS);
 
   // MPU6050 turn-signal
-  YAW_CANCEL_THRESHOLD    = prefs.getFloat("yawCancel",   YAW_CANCEL_THRESHOLD);
+  YAW_CANCEL_THRESHOLD    = sysPrefs.getFloat("yawCancel",   YAW_CANCEL_THRESHOLD);
 
   // Wi-Fi Portal settings
-  AP_SSID                 = prefs.getString("apSsid",   AP_SSID);
-  AP_PASS                 = prefs.getString("apPass",   AP_PASS);
-  PORTAL_TIMEOUT_MS       = prefs.getUInt("portalTime", PORTAL_TIMEOUT_MS);
+  AP_SSID                 = sysPrefs.getString("apSsid",   AP_SSID);
+  AP_PASS                 = sysPrefs.getString("apPass",   AP_PASS);
+  PORTAL_TIMEOUT_MS       = sysPrefs.getUInt("portalTime", PORTAL_TIMEOUT_MS);
 
-  prefs.end();
+  sysPrefs.end();
   Serial.println("[CONFIG] Loaded configuration settings from NVS flash.");
 }
 /**

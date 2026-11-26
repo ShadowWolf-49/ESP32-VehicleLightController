@@ -15,6 +15,8 @@ void handleCalibratePage();
 void handleResetDefaultsPage();
 void handleRebootPage();
 void handleAboutPage();
+void handleOtaComplete();
+void handleOtaUpload();
 
 void webConfigPortalTask(void* pvParameters);
 void startWebPortal();

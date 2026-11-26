@@ -57,6 +57,7 @@ void setup() {
   hazardToBrakeQueue = xQueueCreate(1, sizeof(SignalCommand));
   turnToHazardQueue  = xQueueCreate(1, sizeof(SignalCommand));
   hazardToTurnQueue  = xQueueCreate(1, sizeof(SignalCommand));
+  otaQueue           = xQueueCreate(1, sizeof(OtaEvent));
 
   SignalCommand initialTurn   = CMD_TURN_OFF;
   SignalCommand initialBrake  = CMD_BRAKE_OFF;
@@ -100,8 +101,6 @@ void setup() {
 
   // --- 3. BACKGROUND MULTI-TASKING SCHEDULER LAUNCH ---
   xTaskCreatePinnedToCore(processVehicleTelemetry, "processVehicleTelemetry", 3072, NULL, 1, &telemetryHandle, 1);
-
-
   xTaskCreatePinnedToCore(mainInputProcessorTask, "mainInputTask", 2048, NULL, 2, &inputTaskHandle, 1);
   xTaskCreatePinnedToCore(turnSignalTask, "turnSignalTask", 1536, NULL, 1, &turnTaskHandle, 0);
   xTaskCreatePinnedToCore(hazardTask, "hazardTask", 1536, NULL, 1, &hazardTaskHandle, 0);

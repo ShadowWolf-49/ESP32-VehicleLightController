@@ -1,67 +1,77 @@
 # ESP32 Multi-Core Vehicle Light Controller
 
-A deterministic, real-time automotive lighting controller built using the **Arduino IDE** for the **Aceirmc ESP32-WROOM-32E 8-Channel Relay Development Board** paired with a **KEAcvise GY-521 (MPU6050) 6-Axis IMU Module**. Designed to separate high-speed lighting control and motion sensing from wireless connectivity and system management across the ESP32's dual cores.
+A deterministic, real-time automotive lighting controller built using the **Arduino IDE** for the **Aceirmc ESP32-WROOM-32E 8-Channel Relay Development Board** paired with an optional **KEAcvise GY-521 (MPU6050) 6-Axis IMU Module**. Designed to separate high-speed lighting control from input scanning, motion telemetry, and wireless configuration across the ESP32's dual cores.
 
 ## Overview
 
-Modern vehicle lighting requires zero-lag response for safety-critical signals (braking, deceleration, turn indicators, reverse) alongside customizable auxiliary lighting modes. By pinning time-critical relay switching **Core 0** while running Wi-Fi configuration, input processing and telemetry on **Core 1**, this firmware ensures network traffic never delays critical vehicle light responses.
+Modern vehicle lighting requires immediate, deterministic response for safety-critical signals (braking, deceleration, turn indicators, and hazards) alongside customizable lighting timings. By pinning time-critical relay switching to **Core 0** while running input scanning, MPU6050 telemetry, power supervision, and the Wi-Fi configuration portal on **Core 1**, this firmware ensures network traffic and sensor math never delay critical vehicle light responses.
 
 ## Key Features
 
 * **Dual-Core FreeRTOS Task Separation:**
-  * **Core 1 (Real-Time Control & IMU Engine):** Dedicated exclusively to high-speed I2C polling of the GY-521 MPU6050, deceleration/braking detection, vehicle input reading, and web configuration interface
-  * **Core 0 (Storage & System Management):** Handles all relay outputs, and non-volatile settings storage (`Preferences` / NVS).
-* **IMU-Assisted Motion & Braking Detection:** Uses the 3-axis accelerometer and 3-axis gyroscope on the MPU6050 to detect hard braking (inertia-triggered brake light strobing/override), and turn-rate feedback to disable turn signals after turning.
-* **8-Channel High-Current Relay Switching:** Controls up to 8 independent 12V vehicle lighting circuits (brake lights, turn signals, reverse lights) via onboard SPDT relays (COM, NO, NC). 3 spare relays for possible  (fog lights, DRLs, off-road light bars, and rock lights)
-* **Wide-Range Automotive Power Input:** Leverages the board's onboard DC switching regulator (`7V–30V DC` input) to run directly off a 12V/24V vehicle electrical system.
-* **Fail-Safe Hardware Watchdog:** Monitors Core 1 execution and forces all relays to a safe default state if a sensor or task fault occurs.
+  * **Core 0 (`PRO_CPU` — Real-Time Relay Actuation):** Dedicated exclusively to asynchronous relay tasks (turn signals, brake strobing, hazard blending, and horn) plus a Core 0 hardware watchdog heartbeat.
+  * **Core 1 (`APP_CPU` — Inputs, Telemetry & Web Portal):** Handles hardware ISR button debouncing, hold-duration turn signal tiers, MPU6050 I2C sensor fusion, ignition power state supervision, NVS storage (`Preferences`), and the temporary Wi-Fi configuration/OTA web portal.
+* **IMU-Assisted Motion & Braking Detection (Optional):**
+  * **Auto-Brake & Emergency Strobe:** Uses gravity-compensated forward deceleration to trigger standard brake lights or high-speed emergency brake strobing—even during engine braking or downshifting without touching the pedal.
+  * **Auto-Turn Signal Cancel:** Integrates Z-axis gyroscope yaw rate to automatically cancel turn signals after completing a corner.
+* **Multi-Tiered Turn Signal Controls:** Supports short micro-clicks (lane-change timeout), medium holds (intersection timeout), persistent long holds (infinite latch), and double-tap manual cancellation.
+* **8-Channel High-Current Relay Switching:** Controls 5 primary vehicle circuits (Front Left, Front Right, Rear Left/Brake, Rear Right/Brake, Horn) plus 3 spare relays (`GPIO 14`, `GPIO 12`, `GPIO 13`) for future expansion (fog lights, DRLs, off-road light bars, or rock lights).
+* **Ultra-Low Power Light Sleep:** When Ignition Interlock is enabled and the key is off, the supervisor puts the MPU6050 into standby, grounds all relays, and enters ESP32 Light Sleep—waking instantly on Ignition (`GPIO 4`) or Hazard (`GPIO 5`) activation.
+* **Captive Wi-Fi Configuration & OTA Portal:** Launches a 5-minute Wi-Fi Access Point (`Vehicle_Light_Config`) for live RAM tuning, persistent NVS flash saves, remote MPU6050 calibration, real-time AJAX diagnostics, and Over-The-Air (`.bin`) firmware updates.
+* **Fail-Safe Hardware Watchdog:** Monitors both Core 0 and Core 1 tasks (`3s` timeout) and executes an IRAM fail-safe handler (`esp_task_wdt_isr_user_handler`) to immediately ground all relays if a fault or panic occurs.
 
 ## Architecture
 
-| Core | Assigned FreeRTOS Tasks | Priority |
-| :--- | :--- | :--- |
-| **Core 1 (`APP_CPU`)** | MPU6050 I2C sensor fusion, deceleration/tilt thresholds, vehicle input polling, Wi-Fi / BLE stack, Web UI / REST API server
-| **Core 0 (`PRO_CPU`)** | 8-channel relay state machine | High (Real-Time) NVS flash configuration saves | Normal / Background |
+| Core | Assigned FreeRTOS Tasks | Priority | Role |
+| :--- | :--- | :--- | :--- |
+| **Core 0 (`PRO_CPU`)** | `turnSignalTask`, `hazardTask`, `brakeLightTask`, `hornTask`, `core0WdtTask` | Normal (`1`) | Deterministic relay flasher clocks, brake/hazard duty-cycle blending, and Core 0 WDT heartbeat |
+| **Core 1 (`APP_CPU`)** | `processSystemInterlockSupervisor` | High (`3`) | Manages active/hazard/light-sleep power states and OTA task suspension |
+| **Core 1 (`APP_CPU`)** | `mainInputProcessorTask` | Medium-High (`2`) | Evaluates debounced switch edges, hold tiers, and portal launch combos |
+| **Core 1 (`APP_CPU`)** | `processVehicleTelemetry`, `webConfigPortalTask` | Normal (`1`) | MPU6050 I2C complementary filter, yaw integration, HTTP server, and NVS saves |
+| **Core 1 (`APP_CPU`)** | `systemDiagnosticsTask` | Low (`0`) | Optional serial stack high-water mark and free heap monitor |
 
-*Inter-core state sharing uses thread-safe FreeRTOS queues and mutex-protected structs to prevent race conditions.*
+*Inter-core state sharing uses thread-safe, single-item FreeRTOS queues (`xQueueOverwrite`) and IRAM-safe hardware interrupts.*
 
 ## Hardware Components
 
-* **Main Controller Board:** Aceirmc US AC/DC Power Supply ESP32-WROOM-32E Development Board (8-Channel 5V Relay Module)
-* **Inertial Sensor Module:** KEAcvise GY-521 MPU6050 6-Axis Accelerometer & Gyroscope (I2C)
-* **Power Connection:** Direct `7V–30V DC` terminal block wired to fused 12V vehicle ignition/battery power *(do not connect AC mains in a vehicle installation)*
+* **Main Controller Board:** Aceirmc ESP32-WROOM-32E 8-Channel 5V Relay Development Board
+* **Inertial Sensor Module (Optional):** KEAcvise GY-521 MPU6050 6-Axis Accelerometer & Gyroscope (I2C)
+* **Power Connection:** Direct `7V–30V DC` terminal block wired to fused 12V/24V vehicle power *(do not connect AC mains in a vehicle installation)*
 * **Programming Adapter:** USB-to-TTL Serial Adapter (3.3V logic) connected to the board's `TX`, `RX`, `GND`, and `3V3` programming header
 
 ## Pinout Configuration
 
-*Note: On standard ESP32-WROOM-32E 8-channel relay boards, Relays 1–8 are mapped to GPIOs `32, 33, 25, 26, 27, 14, 12, 13` (verify against your specific board silkscreen or `config.h`).*
+*Note: Verify relay and input GPIO mappings against your specific board silkscreen and `config.cpp`.*
 
 ### 1. Onboard 8-Channel Relay Mapping
 
-| Relay Channel | ESP32 GPIO | Assigned Vehicle Lighting Circuit | Terminal Contact |
+| Relay Channel | ESP32 GPIO | Assigned Vehicle Circuit | Terminal Contact |
 | :--- | :--- | :--- | :--- |
 | **Relay 1** | `GPIO 32` | Front Left Light | `COM` / `NO` |
 | **Relay 2** | `GPIO 33` | Front Right Light | `COM` / `NO` |
-| **Relay 3** | `GPIO 25` | Rear Left/BrakeLight | `COM` / `NO` |
-| **Relay 4** | `GPIO 26` | Rear Right/BrakeLight | `COM` / `NO` |
+| **Relay 3** | `GPIO 25` | Rear Left / Brake Light | `COM` / `NO` |
+| **Relay 4** | `GPIO 26` | Rear Right / Brake Light | `COM` / `NO` |
 | **Relay 5** | `GPIO 27` | Horn | `COM` / `NO` |
-| **Relay 6** | `GPIO 14` | Spare | `COM` / `NO` |
-| **Relay 7** | `GPIO 12` | Spare | `COM` / `NO` |
-| **Relay 8** | `GPIO 13` | Spare | `COM` / `NO` |
+| **Relay 6** | `GPIO 14` | Spare Relay 1 | `COM` / `NO` |
+| **Relay 7** | `GPIO 12` | Spare Relay 2 | `COM` / `NO` |
+| **Relay 8** | `GPIO 13` | Spare Relay 3 | `COM` / `NO` |
 
-| Button Channel | ESP32 GPIO | Assigned Vehicle  Circuit |
-| :--- | :--- | :--- |
-| **Button 1** | `GPIO 18` | Left Turn |
-| **Button 2** | `GPIO 19` | Right Turn |
-| **Button 3** | `GPIO 5` | Hazard |
-| **Button 4** | `GPIO 16` | Horn |
-| **Button 5** | `GPIO 17` | Brake Optional |
-| **Button 6** | `GPIO 4` | Ignition Optional |
-| **Button 7** | `GPIO 2` | Spare Optional |
-| **Button 8** | `GPIO 15` | Spare Optional |
+*Note: Onboard Status LED is mapped to `GPIO 23`.*
 
+### 2. Switch & Button Input Mapping (Active-LOW with Internal Pull-Ups)
 
-### 2. GY-521 MPU6050 IMU Wiring (I2C) | Iptional
+| Input Channel | ESP32 GPIO | Assigned Vehicle Circuit | Switch Type / Notes |
+| :--- | :--- | :--- | :--- |
+| **Button 1** | `GPIO 18` | Left Turn | Momentary push-button (tap/hold tiers) |
+| **Button 2** | `GPIO 19` | Right Turn | Momentary push-button (tap/hold tiers) |
+| **Button 3** | `GPIO 5` | Hazard | Latching toggle switch (also wakes from sleep) |
+| **Button 4** | `GPIO 16` | Horn | Momentary push-button |
+| **Button 5** | `GPIO 17` | Brake Pedal *(Optional)* | Mechanical brake light switch |
+| **Button 6** | `GPIO 4` | Ignition *(Optional)* | Key-on sense (also wakes from sleep) |
+| **Button 7** | `GPIO 2` | Spare Input 1 *(Optional)* | Reserved for future expansion |
+| **Button 8** | `GPIO 15` | Spare Input 2 *(Optional)* | Reserved for future expansion |
+
+### 3. GY-521 MPU6050 IMU Wiring (I2C — Optional)
 
 | GY-521 Pin | ESP32 Pin | Notes |
 | :--- | :--- | :--- |
@@ -71,22 +81,27 @@ Modern vehicle lighting requires zero-lag response for safety-critical signals (
 | **SCL** | `GPIO 22` | Default ESP32 I2C Clock |
 | **AD0** | `GND` | Sets I2C address to `0x68` |
 
+**Sensor Mounting & Calibration:**
+* Mount the GY-521 with the **+Y axis** pointing toward the front of the vehicle (or set `VEHICLE_Y_DIRECTION = -1.0` in the web portal if mounted backward) and the **X axis** across the vehicle side-to-side within `±45°` pitch.
+* To calibrate on a level, stationary surface, either click **Calibrate MPU6050** in the web portal or hold **Left + Right** turn buttons while turning the Ignition ON. All 4 corner lights will flash 3 times upon success.
+
 ## Getting Started (Arduino IDE)
 
 ### 1. Arduino IDE & Board Setup
-1. Install the latest [Arduino IDE](https://arduino.cc).
+1. Install the latest Arduino IDE.
 2. Open **File > Preferences** and add the Espressif ESP32 board manager URL to *Additional Boards Manager URLs*:
    ```text
    https://espressif.github.io/arduino-esp32/package_esp32_index.json
    ```
 3. Go to **Tools > Board > Boards Manager**, search for **esp32** by Espressif Systems, and click **Install**.
-4. Select **Tools > Board > ESP32 Arduino > ESP32 Dev Module**.
+4. Select **Tools > Board > ESP32 Arduino > ESP32 Dev Module** (ensure a partition scheme with OTA support, such as *Default 4MB with spiffs*, is selected).
 
 ### 2. Required Arduino Libraries
 Install the following libraries via **Sketch > Include Library > Manage Libraries**:
 * **Adafruit MPU6050** (by Adafruit)
 * **Adafruit Unified Sensor** (by Adafruit)
-* **ArduinoJson** (by Benoit Blanchon — if using web/API configuration)
+
+*(All other dependencies—`WiFi`, `WebServer`, `Update`, `Preferences`, and `Wire`—are built into the ESP32 Arduino core.)*
 
 ### 3. Flashing the Firmware
 Because the Aceirmc ESP32 8-Channel Relay board uses an external serial header rather than a built-in USB port:
@@ -95,18 +110,21 @@ Because the Aceirmc ESP32 8-Channel Relay board uses an external serial header r
 3. Select the correct COM port under **Tools > Port** and click **Upload** in the Arduino IDE.
 4. Press **`EN` (RESET)** once uploading finishes to boot the dual-core firmware.
 
+### 4. Accessing the Wi-Fi Configuration Portal
+* **At Boot / Ignition On:** The Wi-Fi Access Point starts automatically for 5 minutes (default SSID: `Vehicle_Light_Config`, Password: `12345678`).
+* **Manual Trigger (when Ignition Interlock is disabled):** Hold **Hazard + Horn** simultaneously for 2 seconds (all 4 corner lights will flash twice to confirm).
+* Connect to the Wi-Fi network and navigate to **`http://192.168.4.1`** in your browser.
+
 ## Roadmap
-* Add running lights to turn on when Ignition is on
-* Add OTA to web configuration
-* Add remote start features
-   * Input RPM readings to make sure running
-   * Use Second ESP-32 for remote start button
-       * Press and hold once / Start
-       * Press and hold again / Stop
+* Add running lights (DRLs) tied to Ignition ON state
+* ~~Add OTA to web configuration~~ *(Completed)*
+* Add remote start integration:
+  * Tachometer / RPM pulse input to verify engine running state
+  * Secondary ESP32 wireless remote fob (press-and-hold to start / press-and-hold to stop)
 
 ## Automotive Safety Disclaimer
 
-> **WARNING:** Modifying vehicle lighting systems is subject to local, state, and federal road safety regulations (such as DOT/SAE or ECE standards). Ensure all custom lighting modes, strobes, and auxiliary light bars comply with local laws before operating on public roads. Always mount the relay board inside a non-conductive, vibration-resistant enclosure, install appropriate inline automotive fuses on all 12V supply lines, and verify fail-safe relay states before driving.
+> **WARNING:** Modifying vehicle lighting systems is subject to local, state, and federal road safety regulations (such as DOT/SAE or ECE standards). Ensure all custom lighting modes, strobes, and auxiliary light bars comply with local laws before operating on public roads. Always mount the relay board inside a non-conductive, vibration-resistant enclosure, install appropriate inline automotive fuses on all 12V/24V supply lines, and verify fail-safe relay states before driving.
 
 ## Contributing
 
@@ -131,4 +149,4 @@ This firmware is licensed under the **GNU Affero General Public License v3.0 (AG
 * **Preserve Credit:** All original copyright notices, author attributions, and license texts must remain intact in any copies or derivative works.
 
 ### Commercial Licensing
-If you are a business or hardware manufacturer looking to integrate this firmware into a proprietary, closed-source commercial product without AGPL-3.0 obligations, please contact Rocky Andersen [rlandersen@net-shadow.net] to inquire about a private commercial license.
+If you are a business or hardware manufacturer looking to integrate this firmware into a proprietary, closed-source commercial product without AGPL-3.0 obligations, please contact Rocky Andersen (`rlandersen@net-shadow.net`) to inquire about a private commercial license.

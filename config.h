@@ -30,6 +30,12 @@ enum SignalCommand {
   CMD_IGNITION_OFF
 };
 
+enum OtaEvent : uint8_t {
+  OTA_EVENT_NONE = 0,
+  OTA_EVENT_START,
+  OTA_EVENT_ABORT
+};
+
 struct Button {
   const uint8_t value;
   volatile bool isPressed = false;
@@ -121,7 +127,6 @@ extern uint32_t PORTAL_TIMEOUT_MS;
 // Webserver & Storage
 extern WebServer configServer;
 extern uint32_t portalStartTime;
-extern Preferences prefs;
 
 // Brake & Ignition Trackers
 extern uint32_t brakeStartTime;
@@ -166,6 +171,7 @@ extern QueueHandle_t ignitionQueue;
 extern QueueHandle_t hornQueue;
 extern QueueHandle_t turnCancelQueue;
 extern QueueHandle_t calibrationQueue;
+extern QueueHandle_t otaQueue;
 
 extern QueueHandle_t turnToBrakeQueue;
 extern QueueHandle_t brakeToTurnQueue;

@@ -2,10 +2,24 @@
 #include "mpu_sensor.h"
 #include "web_portal.h"
 #include "inputs.h"
+#include "relays.h"
 #include <esp_sleep.h>
 #include <driver/gpio.h>
 #include <esp_task_wdt.h>
 
+  // HELPER LAMBDA to safely suspend tasks only if not already suspended
+  auto safeSuspend = [](TaskHandle_t handle) {
+    if (handle != NULL && eTaskGetState(handle) != eSuspended) {
+      vTaskSuspend(handle);
+    }
+  };
+
+  // HELPER LAMBDA to safely resume tasks only if currently suspended
+  auto safeResume = [](TaskHandle_t handle) {
+    if (handle != NULL && eTaskGetState(handle) == eSuspended) {
+      vTaskResume(handle);
+    }
+  };
 /**
   * @brief Central Supervisor Loop running on Core 1 matching state-aware philosophy.
   * Coordinates multi-core thread lifecycles and physical hardware power gates across three
@@ -31,6 +45,10 @@ void processSystemInterlockSupervisor(void* pvParameters) {
   ignitionMode = CMD_IGNITION_OFF;
   SignalCommand currentHazardMode = CMD_HAZARD_OFF;
 
+  // Tracks if OTA is in progress
+  bool otaInProgress = false; // Local to supervisor task (Core 1 only)
+  OtaEvent incomingOtaEvent = OTA_EVENT_NONE;
+
   // Tracks watchdog subscription
   bool telemetryWdtActive = false;
   bool inputWdtActive     = false;
@@ -49,6 +67,39 @@ void processSystemInterlockSupervisor(void* pvParameters) {
   };
 
   for (;;) {
+
+    // 0. OTA LAYER
+    // Check queue for OTA start/abort events from Core 0
+    if (otaQueue != NULL && xQueueReceive(otaQueue, &incomingOtaEvent, 0) == pdTRUE) {
+      if (incomingOtaEvent == OTA_EVENT_START) {
+        otaInProgress = true;
+
+        // Unsubscribe all WDTs BEFORE suspending the tasks
+        setTaskWdt(telemetryHandle, telemetryWdtActive, false);
+        setTaskWdt(inputTaskHandle, inputWdtActive,     false);
+        setTaskWdt(core0WdtHandle,  core0WdtActive,     false);
+
+        safeSuspend(telemetryHandle);
+        safeSuspend(inputTaskHandle);
+        safeSuspend(core0WdtHandle);
+        safeSuspend(brakeTaskHandle);
+        safeSuspend(turnTaskHandle);
+        safeSuspend(hazardTaskHandle);
+        safeSuspend(hornTaskHandle);
+        safeSuspend(diagnosticsTaskHandle);
+
+        // Ground all relays immediately
+        groundAllRelaysFailSafe();
+      } else if (incomingOtaEvent == OTA_EVENT_ABORT) {
+        otaInProgress = false;
+        activeStateProfile = 0; // Force supervisor to re-apply current state & resume tasks
+      }
+    }
+
+    if (otaInProgress) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
 
     // 1. DATA PIPELINE ACQUISITION LAYER
     // Non-blocking fetch (0-timeout) to drain the latest status tokens from Core 1 input tasks
@@ -84,6 +135,12 @@ void processSystemInterlockSupervisor(void* pvParameters) {
         if (leftHeld && rightHeld) {
           Serial.println("[SUPERVISOR] Hidden Calibration Sequence Triggered via Multi-Button Hold!");
           
+          // Ensure Core 0 lighting tasks are suspended before manual visual feedback
+          safeSuspend(turnTaskHandle);
+          safeSuspend(hazardTaskHandle);
+          safeSuspend(brakeTaskHandle);
+
+
           // Ground light arrays to prevent visual strobe flickering during calibration
           FrontLeft  = false;
           FrontRight = false;
@@ -99,7 +156,8 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           // Trigger your existing 6-axis static calibration routine
           // This function automatically flashes all 4 indicators 3 times on success
           if (performSensorCalibration()) {
-                        
+            // Explicitly mark MPU brake ready 
+            mpuBrakeAvailable     = true;    
             // Force your live running filter engines to immediately adopt the fresh RAM calculations
             vehiclePitchRad       = staticMountPitchRad; 
             filteredVehicleAccelY = 0.0;
@@ -113,8 +171,16 @@ void processSystemInterlockSupervisor(void* pvParameters) {
 
             Serial.println("[SUPERVISOR] Manual recalibration sequence completed successfully.");
           } else {
+            // Disable MPU brake if recalibration fails
+            mpuBrakeAvailable     = false; 
             Serial.println("[SUPERVISOR] Manual recalibration FAILED. Check chasis stability.");
           }
+
+          // Re-suspend Core 0 lighting tasks in case performSensorCalibration() resumed them;
+          // Case 1 below will perform the clean, synchronized resume.
+          safeSuspend(turnTaskHandle);
+          safeSuspend(hazardTaskHandle);
+          safeSuspend(brakeTaskHandle);
         }
       }
 
@@ -135,14 +201,14 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           }
 
           // Thread Recovery Routine: Un-suspend tasks across both processing cores
-          if (telemetryHandle  != NULL) vTaskResume(telemetryHandle);
-          if (brakeTaskHandle  != NULL) vTaskResume(brakeTaskHandle);
-          if (turnTaskHandle   != NULL) vTaskResume(turnTaskHandle);
-          if (inputTaskHandle  != NULL) vTaskResume(inputTaskHandle);
-          if (hazardTaskHandle != NULL) vTaskResume(hazardTaskHandle);
-          if (hornTaskHandle   != NULL) vTaskResume(hornTaskHandle);
-          if (diagnosticsTaskHandle != NULL) vTaskResume(diagnosticsTaskHandle);
-          if (core0WdtHandle   != NULL) vTaskResume(core0WdtHandle);
+          safeResume(telemetryHandle);
+          safeResume(brakeTaskHandle);
+          safeResume(turnTaskHandle);
+          safeResume(inputTaskHandle);
+          safeResume(hazardTaskHandle);
+          safeResume(hornTaskHandle);
+          safeResume(diagnosticsTaskHandle);
+          safeResume(core0WdtHandle);
 
           // Subscribe all resumed tasks to the Hardware Watchdog
           setTaskWdt(telemetryHandle, telemetryWdtActive, true);
@@ -165,20 +231,22 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           setTaskWdt(telemetryHandle, telemetryWdtActive, false);
 
           // Freeze background evaluation engines and telemetry loops to preserve vehicle battery
-          if (telemetryHandle  != NULL) vTaskSuspend(telemetryHandle);
-          if (brakeTaskHandle  != NULL) vTaskSuspend(brakeTaskHandle);
-          if (turnTaskHandle   != NULL) vTaskSuspend(turnTaskHandle);
-          if (hornTaskHandle   != NULL) vTaskSuspend(hornTaskHandle);
-          if (diagnosticsTaskHandle != NULL) vTaskSuspend(diagnosticsTaskHandle);
+          safeSuspend(telemetryHandle);
+          safeSuspend(brakeTaskHandle);
+          safeSuspend(turnTaskHandle);
+          safeSuspend(hornTaskHandle);
+          safeSuspend(diagnosticsTaskHandle);
 
           // Ensure human interface input loop stays alive on Core 1 to catch the hazard shutoff tap
-          if (inputTaskHandle  != NULL) vTaskResume(inputTaskHandle);
-          if (core0WdtHandle   != NULL) vTaskResume(core0WdtHandle);
-          if (hazardTaskHandle != NULL) vTaskResume(hazardTaskHandle);
+          safeResume(inputTaskHandle);
+          safeResume(core0WdtHandle);
+          safeResume(hazardTaskHandle);
 
           // Flush volatile turn and brake variables down to safe default definitions
           signalMode = CMD_TURN_OFF;
           brakeMode  = CMD_BRAKE_OFF;
+          // Clear stale MPU brake latCH
+          mpuBrakeActive = false;
           
           {
             SignalCommand flushTurn  = CMD_TURN_OFF;
@@ -220,20 +288,17 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           setTaskWdt(core0WdtHandle,  core0WdtActive,     false);
 
           // 1. Thread Teardown Strategy: Suspend processing loops across both execution cores
-          if (telemetryHandle != NULL) vTaskSuspend(telemetryHandle);
-          if (inputTaskHandle != NULL)  vTaskSuspend(inputTaskHandle);
-          if (core0WdtHandle != NULL) vTaskSuspend(core0WdtHandle);
-          if (brakeTaskHandle  != NULL) vTaskSuspend(brakeTaskHandle);
-          if (turnTaskHandle   != NULL) vTaskSuspend(turnTaskHandle);
-          if (hazardTaskHandle != NULL) vTaskSuspend(hazardTaskHandle);
-          if (hornTaskHandle   != NULL) vTaskSuspend(hornTaskHandle);
-          if (diagnosticsTaskHandle != NULL) vTaskSuspend(diagnosticsTaskHandle);
+          safeSuspend(telemetryHandle);
+          safeSuspend(inputTaskHandle);
+          safeSuspend(core0WdtHandle);
+          safeSuspend(brakeTaskHandle);
+          safeSuspend(turnTaskHandle);
+          safeSuspend(hazardTaskHandle);
+          safeSuspend(hornTaskHandle);
+          safeSuspend(diagnosticsTaskHandle);
 
           // 2. Hardware Safety Isolation: Ground output channels to protect against continuous battery drain
-          for (int i = 0; i < NUM_RELAYS; i++) {
-            digitalWrite(relays[i]->value, LOW);
-            relays[i]->isOn = false;
-          }
+          groundAllRelaysFailSafe();
 
           // 3. Sensor Hibernation Block: Place MPU6050 register tracks into sleep mode
           if (mpuAvailable) {
@@ -244,6 +309,8 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           // 4. Reset internal software states down to clean base assumptions
           signalMode = CMD_TURN_OFF;
           brakeMode  = CMD_BRAKE_OFF;
+          // Clear stale MPU brake latch
+          mpuBrakeActive = false;
           
           {
             SignalCommand cleanTurn  = CMD_TURN_OFF;
@@ -286,10 +353,13 @@ void processSystemInterlockSupervisor(void* pvParameters) {
 
           // Wake inputTaskHandle so it can process the GPIO trigger and populate the queues!
           if (inputTaskHandle != NULL) {
-            vTaskResume(inputTaskHandle);
+            safeResume(inputTaskHandle);
+            xTaskAbortDelay(inputTaskHandle);
             setTaskWdt(inputTaskHandle, inputWdtActive, true);
           }
-          vTaskDelay(pdMS_TO_TICKS(25)); // Give Core 1 input task one cycle to read pins & post to queues
+          vTaskDelay(pdMS_TO_TICKS(35)); // Give Core 1 input task time to read pins & post to queues
+
+          activeStateProfile = 0; // Forces re-evaluation so glitch wakeups go back to sleep
           break;
       }
     }
@@ -335,7 +405,7 @@ void systemDiagnosticsTask(void* pvParameters) {
       Serial.printf("  -> brakeLightTask          : %d words free\n", (int)uxTaskGetStackHighWaterMark(brakeTaskHandle)); // Checked using conditional handle mappings
     }
     if (hornTaskHandle != NULL) {
-        Serial.printf("  -> hornTask          : %d words free\n", (int)uxTaskGetStackHighWaterMark(hornTaskHandle)); // Checked using conditional handle mappings
+      Serial.printf("  -> hornTask                : %d words free\n", (int)uxTaskGetStackHighWaterMark(hornTaskHandle)); // Checked using conditional handle mappings
     }
 
     // Capture the internal supervisor task directly (using a local self-query if called inside it, 

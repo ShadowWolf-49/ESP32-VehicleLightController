@@ -2,8 +2,11 @@
 #include "storage.h"
 #include "mpu_sensor.h"
 #include <WiFi.h>
+#include <Update.h>
 #include <esp_task_wdt.h>
 
+// Thread-safe shutdown flag so webConfigPortalTask always self-deletes cleanly
+static volatile bool portalStopRequested = false;
 /**
   * @brief Builds the live AJAX-enabled diagnostics webpage with real-time relay badges.
   */
@@ -284,7 +287,74 @@ String buildConfigHTML(String statusBanner) {
             "<form action='/reboot' method='POST' style='flex:1;min-width:140px;' onsubmit=\"return confirm('Reboot the ESP32 controller now? Unsaved RAM changes will be lost.');\">"
             "<button type='submit' style='width:100%;background:#e65100;color:#fff;'>Reboot Controller</button>"
             "</form>"
-            "</div></body></html>");
+            "</div>"
+             "<h3>Firmware Update (OTA)</h3>"
+            "<form id='otaForm' action='/update' method='POST' enctype='multipart/form-data' style='margin-bottom:25px;'>"
+            "<div class='row' style='gap:10px;'>"
+            "<input type='file' id='otaFile' name='firmware' accept='.bin' required style='flex:1;color:#ccc;'>"
+            "<button type='submit' id='otaBtn' style='flex:0 0 auto;padding:10px 16px;background:#00695c;color:#fff;'>Flash .bin</button>"
+            "</div>"
+            "<div id='otaWrap' style='display:none;margin-top:12px;'>"
+            "<div style='width:100%;background:#2a2a2a;border-radius:6px;overflow:hidden;height:22px;border:1px solid #444;'>"
+            "<div id='otaBar' style='width:0%;height:100%;background:#00897b;transition:width 0.15s;text-align:center;line-height:22px;font-size:12px;font-weight:bold;color:#fff;'>0%</div>"
+            "</div>"
+            "<div id='otaStatus' style='margin-top:6px;font-size:13px;color:#aaa;'>Preparing upload...</div>"
+            "</div>"
+            "</form>"
+            "<script>"
+            "document.getElementById('otaForm').addEventListener('submit',function(e){"
+            "e.preventDefault();"
+            "var f=document.getElementById('otaFile').files[0];"
+            "if(!f)return;"
+            "var lowName=f.name.toLowerCase();"
+            "if(lowName.indexOf('bootloader')!==-1||lowName.indexOf('partitions')!==-1||lowName.indexOf('boot_app')!==-1){"
+            "alert('Invalid file: Do not flash bootloader or partition binaries. Select your compiled application .bin file.');"
+            "return;"
+            "}"
+            "var reader=new FileReader();"
+            "reader.onload=function(ev){"
+            "var header=new Uint8Array(ev.target.result);"
+            "if(header.length<1||header[0]!==0xE9){"
+            "alert('Invalid ESP32 firmware binary (missing 0xE9 magic byte). Make sure you exported a compiled .bin file.');"
+            "return;"
+            "}"
+            "if(!confirm('Upload and flash '+f.name+'? All relays will turn OFF during update.'))return;"
+            "var btn=document.getElementById('otaBtn'),wrap=document.getElementById('otaWrap'),"
+            "bar=document.getElementById('otaBar'),st=document.getElementById('otaStatus');"
+            "btn.disabled=true;btn.style.opacity='0.5';wrap.style.display='block';"
+            "bar.style.background='#00897b';bar.style.width='0%';bar.textContent='0%';st.style.color='#aaa';"
+            "var fd=new FormData();fd.append('firmware',f);"
+            "var xhr=new XMLHttpRequest();"
+            "xhr.open('POST','/update',true);"
+            "xhr.upload.onprogress=function(pev){"
+            "if(pev.lengthComputable){"
+            "var pct=Math.round((pev.loaded/pev.total)*100);"
+            "bar.style.width=pct+'%';bar.textContent=pct+'%';"
+            "st.textContent=pct<100?'Uploading firmware ('+Math.round(pev.loaded/1024)+' KB)...':'Verifying & finalizing flash...';"
+            "}"
+            "};"
+            "xhr.onload=function(){"
+            "if(xhr.status===200&&xhr.responseText.indexOf('OK')===0){"
+            "bar.style.background='#2e7d32';bar.style.width='100%';bar.textContent='100%';"
+            "st.style.color='#81c784';st.textContent='Update successful! Rebooting controller, reloading in 6s...';"
+            "setTimeout(function(){window.location.href='/';},6000);"
+            "}else{"
+            "bar.style.background='#c62828';st.style.color='#ff5252';"
+            "st.textContent='Update failed: '+(xhr.responseText||'Server error');"
+            "btn.disabled=false;btn.style.opacity='1';"
+            "}"
+            "};"
+            "xhr.onerror=function(){"
+            "bar.style.background='#c62828';st.style.color='#ff5252';"
+            "st.textContent='Connection lost during upload.';"
+            "btn.disabled=false;btn.style.opacity='1';"
+            "};"
+            "xhr.send(fd);"
+            "};"
+            "reader.readAsArrayBuffer(f.slice(0,4));"
+            "});"
+            "</script>"
+            "</body></html>");
   return html;
 }
 /**
@@ -533,6 +603,123 @@ void handleRebootPage() {
   ESP.restart();
 }
 /**
+  * @brief Sends the final HTTP status after an OTA upload finishes and reboots.
+  */
+void handleOtaComplete() {
+  bool ok = !Update.hasError();
+
+  if (ok) {
+    configServer.send(200, "text/plain", "OK");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    Serial.flush();
+    ESP.restart();
+  } else {
+    configServer.send(500, "text/plain", "FAIL (Error " + String(Update.getError()) + ")");
+  }
+}
+/**
+  * @brief Streams uploaded .bin firmware chunks into flash memory while validating the ESP32 image header.
+  */
+void handleOtaUpload() {
+  HTTPUpload& upload = configServer.upload();
+  static bool otaRejected = false; // Tracks whether the current upload was aborted to ignore trailing chunks
+
+  // 1. INITIALIZATION PHASE: Triggered once when the multipart file stream begins
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.printf("[OTA] Starting firmware update: %s\n", upload.filename.c_str());
+    otaRejected     = false;    // Reset rejection latch for the new upload attempt
+    portalStartTime = millis(); // Refresh portal inactivity timer so the server doesn't time out mid-flash
+
+    // Notify Core 1 supervisor to unsubscribe WDTs, suspend worker tasks, and turn OFF all relays
+    if (otaQueue != NULL) {
+      OtaEvent evt = OTA_EVENT_START;
+      xQueueOverwrite(otaQueue, &evt);
+      vTaskDelay(pdMS_TO_TICKS(60)); // Yield briefly so Core 1 finishes teardown before flash writes start
+    }
+
+    // Allocate the next available OTA app partition (size determined dynamically as chunks arrive)
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+      otaRejected = true;
+
+      // Unlock supervisor and restore normal vehicle operation if partition initialization fails
+      if (otaQueue != NULL) {
+        OtaEvent evt = OTA_EVENT_ABORT;
+        xQueueOverwrite(otaQueue, &evt);
+      }
+    }
+
+  // 2. STREAMING PHASE: Triggered repeatedly for each incoming TCP data chunk
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    // Skip remaining incoming packets if an earlier check or write already failed
+    if (otaRejected) return;
+
+    portalStartTime = millis(); // Keep portal alive during slow Wi-Fi transfers
+
+    // Server-side 0xE9 magic-byte check on the very first chunk (totalSize == 0 before first write)
+    // Rejects non-firmware files (e.g., .ino, .txt, .zip) before erasing or writing any flash sectors
+    if (upload.totalSize == 0 && upload.currentSize > 0 && upload.buf[0] != 0xE9) {
+      Serial.printf("[OTA] Rejected invalid binary (first byte: 0x%02X, expected 0xE9).\n", upload.buf[0]);
+      Update.abort();
+      otaRejected = true;
+
+      // Restore normal vehicle operation immediately
+      if (otaQueue != NULL) {
+        OtaEvent evt = OTA_EVENT_ABORT;
+        xQueueOverwrite(otaQueue, &evt);
+      }
+      return;
+    }
+
+    // Write the current RAM buffer chunk into the OTA flash partition and verify byte count
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+      Update.abort();
+      otaRejected = true;
+
+      // Restore normal vehicle operation if a flash write error occurs
+      if (otaQueue != NULL) {
+        OtaEvent evt = OTA_EVENT_ABORT;
+        xQueueOverwrite(otaQueue, &evt);
+      }
+    }
+
+  // 3. FINALIZATION PHASE: Triggered once after the final byte of the file is received
+  } else if (upload.status == UPLOAD_FILE_END) {
+    // Do not finalize or swap boot partitions if the upload was rejected earlier
+    if (otaRejected) return;
+
+    // Validate image checksum/MD5 and set the newly flashed OTA partition as the next boot target
+    if (Update.end(true)) {
+      Serial.printf("[OTA] Update successful: %u bytes written.\n", upload.totalSize);
+    } else {
+      Update.printError(Serial);
+
+      // Restore normal vehicle operation if final verification fails
+      if (otaQueue != NULL) {
+        OtaEvent evt = OTA_EVENT_ABORT;
+        xQueueOverwrite(otaQueue, &evt);
+      }
+    }
+
+  // 4. DISCONNECT PHASE: Triggered if the browser/client drops the connection mid-upload
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Serial.println("[OTA] Upload aborted by client.");
+
+    // Clean up any open flash update session if it wasn't already aborted
+    if (!otaRejected) {
+      Update.abort();
+      otaRejected = true;
+    }
+
+    // Always notify supervisor to resume vehicle tasks and watchdogs
+    if (otaQueue != NULL) {
+      OtaEvent evt = OTA_EVENT_ABORT;
+      xQueueOverwrite(otaQueue, &evt);
+    }
+  }
+}
+/**
   * @brief Restores all user settings to factory defaults and reloads the page.
   */
 void handleResetDefaultsPage() {
@@ -557,6 +744,7 @@ void handleCalibratePage() {
   bool success = performSensorCalibration();
 
   if (success) {
+    mpuBrakeAvailable     = true; // Enable MPU brake engine on successful web calibration
     vehiclePitchRad       = staticMountPitchRad;
     filteredVehicleAccelY = 0.0;
     mpuBrakeActive        = false;
@@ -564,6 +752,15 @@ void handleCalibratePage() {
     mpuEmergencyCandidate = false;
     accumulatedYaw        = 0.0;
     turnInitiated         = false;
+  
+  // Clear any latched MPU brake light output on Core 0 if pedal isn't pressed
+    if (!Brake.isPressed && brakeMode != CMD_BRAKE_OFF) {
+      brakeMode = CMD_BRAKE_OFF;
+      xQueueOverwrite(brakeQueue, &brakeMode);
+    }
+  } else {
+    // Disable MPU brake engine if recalibration fails
+    mpuBrakeAvailable     = false; 
   }
 
   // Resume telemetry I2C polling via queue
@@ -601,6 +798,9 @@ void handleRootPage() {
   * @param pvParameters Standard untyped FreeRTOS task argument block pointer (Unused).
   */
 void webConfigPortalTask(void* pvParameters) {
+  // Clear any stale stop signal on startup
+  portalStopRequested = false;
+
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID.c_str(), AP_PASS.c_str());
   portalStartTime = millis();
@@ -610,6 +810,7 @@ void webConfigPortalTask(void* pvParameters) {
   configServer.on("/calibrate", HTTP_POST, handleCalibratePage);
   configServer.on("/reset-defaults", HTTP_POST, handleResetDefaultsPage);
   configServer.on("/reboot", HTTP_POST, handleRebootPage);
+  configServer.on("/update", HTTP_POST, handleOtaComplete, handleOtaUpload);
   configServer.on("/diagnostics", HTTP_GET, handleDiagnosticsPage);
   configServer.on("/diag-data", HTTP_GET, handleDiagnosticsJSON);
   configServer.on("/about", HTTP_GET, handleAboutPage);
@@ -622,29 +823,37 @@ void webConfigPortalTask(void* pvParameters) {
   Serial.println(WiFi.softAPIP());
   Serial.println("=========================================================");
 
-  while (millis() - portalStartTime < PORTAL_TIMEOUT_MS) {
+  // Exit cleanly if either the timeout expires OR stopWebPortal() sets portalStopRequested
+  while (!portalStopRequested && (millis() - portalStartTime < PORTAL_TIMEOUT_MS)) {
     configServer.handleClient();
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 
-  // 5 minutes elapsed: Cleanly tear down server and disable Wi-Fi radio
-  Serial.println("[PORTAL] 5-minute window expired. Shutting down Wi-Fi portal...");
+  // Cleanly tear down server and disable Wi-Fi radio inside the owning task
+  if (portalStopRequested) {
+    Serial.println("[PORTAL] Early shutdown requested. Closing Wi-Fi portal...");
+  } else {
+    Serial.println("[PORTAL] 5-minute window expired. Shutting down Wi-Fi portal...");
+  }
+
   configServer.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);
 
+  portalStopRequested = false;
   webPortalTaskHandle = NULL;
-  vTaskDelete(NULL); // Self-terminate task cleanly
+  vTaskDelete(NULL); // Self-terminate task safely
 }
 /**
   * @brief Safely launches the 5-minute Wi-Fi Configuration Portal if not already active.
   */
 void startWebPortal() {
   if (webPortalTaskHandle == NULL) {
+    portalStopRequested = false;
     xTaskCreatePinnedToCore(
       webConfigPortalTask,
       "webConfigPortal",
-      4096,
+      6144,
       NULL,
       1,
       &webPortalTaskHandle,
@@ -653,22 +862,17 @@ void startWebPortal() {
     Serial.println("[PORTAL] Ignition ON detected: Launching 5-minute Wi-Fi portal.");
   } else {
     // If already running, reset the 5-minute timer
+    portalStopRequested = false;
     portalStartTime = millis();
     Serial.println("[PORTAL] Portal already active: Resetting 5-minute timer.");
   }
 }
 /**
-  * @brief Forcefully stops the Wi-Fi portal early (e.g., when Ignition turns OFF before 5 mins).
+  * @brief Signals the Wi-Fi portal task to shut down cleanly and self-delete.
   */
 void stopWebPortal() {
   if (webPortalTaskHandle != NULL) {
-    Serial.println("[PORTAL] Ignition OFF detected: Shutting down Wi-Fi portal early...");
-    configServer.stop();
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_OFF);
-
-    TaskHandle_t tempHandle = webPortalTaskHandle;
-    webPortalTaskHandle = NULL;
-    vTaskDelete(tempHandle);
+    Serial.println("[PORTAL] Signaling Wi-Fi portal to shut down...");
+    portalStopRequested = true; // Let webConfigPortalTask exit its loop and self-delete safely
   }
 }

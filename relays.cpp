@@ -117,6 +117,11 @@ void brakeLightTask(void* pvParameters) {
             // Apply strobe state modifications while bypassing active turn signal channels
             if (currentSignalMode != CMD_LEFT)  BackLeft = strobeState;
             if (currentSignalMode != CMD_RIGHT) BackRight = strobeState;
+          } else {
+            // Ensure non-turning rear channel stays synced with current strobe phase
+            // immediately after a turn signal cancels mid-brake
+            if (currentSignalMode != CMD_LEFT)  BackLeft = strobeState;
+            if (currentSignalMode != CMD_RIGHT) BackRight = strobeState;
           }
         } else {
           // Maintain continuous baseline safety hold state after strobe window expires
@@ -163,6 +168,7 @@ void turnSignalTask(void* pvParameters) {
   uint32_t flashTimer  = 0;     // High-resolution timestamp tracking individual blinker cadences
   bool blinkToggle     = false; // Local asynchronous logic level cache for physical relay pins
   bool turnActive      = false; // Internal tracking flag dictating dynamic queue blocking timeouts
+  bool wasTurnActive   = false; // <-- ADDED: Tracks previous active turn state for clean single-pass handoff
 
   // Infinite execution boundary container keeping Core 0 background OS scheduler thread fed
   for (;;) {
@@ -214,8 +220,14 @@ void turnSignalTask(void* pvParameters) {
       continue;
     }
 
+    // <-- MOVED & ADDED: Compute brakeActive here so all branches below can read it
+    bool brakeActive = (currentBrakeMode == CMD_BRAKE || currentBrakeMode == CMD_EMERGENCY_BRAKE || Brake.isPressed);
+    
     // --- 3. ACTIVE ASYNCHRONOUS FLASHER ENGINE ---
     if (turnActive) {
+      // Latch state so idle handoff runs once when turn finishes
+      wasTurnActive = true; 
+
       // Compute total elapsed duration since initial channel engagement
       uint32_t duration = millis() - dynamicModeStartTime;
 
@@ -223,6 +235,7 @@ void turnSignalTask(void* pvParameters) {
       if (duration >= activeTimeout) {
         receivedCmd = CMD_TURN_OFF; // Force tracking registers back to idle states
         turnActive  = false;
+        wasTurnActive = false;
         
         // Immediate clean teardown profile
         FrontLeft   = false;               
@@ -230,36 +243,28 @@ void turnSignalTask(void* pvParameters) {
         
         // RECOVERY ROUTINE: Hand off the rear combination outputs back to their expected 
         // background braking baseline exclusively when the blinking sequence terminates.
-        bool brakeActive = (currentBrakeMode == CMD_BRAKE || currentBrakeMode == CMD_EMERGENCY_BRAKE || Brake.isPressed);
         BackLeft   = brakeActive;
         BackRight  = brakeActive;
 
         // Notify Core 1 that the turn signal timed out
         SignalCommand cancelCmd = CMD_TURN_OFF;
         xQueueOverwrite(turnCancelQueue, &cancelCmd);
-      } 
-      
-      // TIMING CADENCE SWITCH: Toggle physical trace footprints once interval parameters are achieved
-      else if (millis() - flashTimer >= blinkFlashInterval) {
-        flashTimer  = millis();      // Advance differential reference frame
-        blinkToggle = !blinkToggle;  // Alternate internal logic state
+      } else {
+        // TIMING CADENCE SWITCH: Toggle physical trace footprints once interval parameters are achieved
+        if (millis() - flashTimer >= blinkFlashInterval) {
+          flashTimer  = millis();      // Advance differential reference frame
+          blinkToggle = !blinkToggle;  // Alternate internal logic state
+        }
 
-        bool brakeActive = (currentBrakeMode == CMD_BRAKE || currentBrakeMode == CMD_EMERGENCY_BRAKE || Brake.isPressed);
-
-        // Handle routing maps for LEFT activation profiles
+        // Apply active turn outputs immediately on edge strike and every cadence tick
         if (receivedCmd == CMD_LEFT) {
           FrontLeft  = blinkToggle;   
           BackLeft   = blinkToggle;   // Left turning track takes absolute priority over brakes
-          
           FrontRight = false;         // Double-guard isolation: Maintain opposing track low
           BackRight  = brakeActive;   // Opposing side rear element maintains standard brake behavior
-        } 
-        
-        // Handle routing maps for RIGHT activation profiles
-        else if (receivedCmd == CMD_RIGHT) {
+        } else if (receivedCmd == CMD_RIGHT) {
           FrontLeft  = false;         // Double-guard isolation: Maintain opposing track low
           BackLeft   = brakeActive;   // Opposing side rear element maintains standard brake behavior
-          
           FrontRight = blinkToggle;  
           BackRight  = blinkToggle;   // Right turning track takes absolute priority over brakes
         }
@@ -267,13 +272,13 @@ void turnSignalTask(void* pvParameters) {
     } 
     
     // --- 4. SAFE IDLE HANDOFF HANDLING LAYER (Fired when receivedCmd == CMD_TURN_OFF) ---
-    else {
+    else if (wasTurnActive) {
+      wasTurnActive = false;
       // Clean flush: Instantly drop front vehicle indicator lines to a low potential trace state
       FrontLeft  = false;
       FrontRight = false;
       
-      // Split-Side Priority Alignment: Ensure both rear sides immediately track the master braking baseline
-      bool brakeActive = (currentBrakeMode == CMD_BRAKE || currentBrakeMode == CMD_EMERGENCY_BRAKE);
+      // Hand rear channels back to baseline braking state once; brakeLightTask owns them while idle
       BackLeft   = brakeActive;
       BackRight  = brakeActive;
     }
@@ -297,9 +302,11 @@ void hazardTask(void* pvParameters) {
   SignalCommand currentBrakeMode  = CMD_BRAKE_OFF;
   SignalCommand currentTurnMode   = CMD_TURN_OFF;
 
-  uint32_t flashTimer = 0;
-  bool hazardToggle   = false;
-  bool hazardActive   = false;
+  uint32_t flashTimer   = 0;
+  uint32_t cycleTimer   = 0;
+  bool hazardToggle     = false;
+  bool hazardActive     = false;
+  bool wasHazardActive  = false;
 
   for (;;) {
     SignalCommand incomingCmd;
@@ -309,6 +316,7 @@ void hazardTask(void* pvParameters) {
     if (xQueueReceive(hazardQueue, &incomingCmd, waitTime) == pdPASS) {
       if (incomingCmd != receivedHazardCmd || !hazardActive) {
         flashTimer   = millis();
+        cycleTimer   = millis();
         hazardToggle = true; // Instantly illuminate elements on initial edge strike
       }
       receivedHazardCmd = incomingCmd;
@@ -322,10 +330,19 @@ void hazardTask(void* pvParameters) {
 
     // --- 3. ACTIVE HAZARD ENGINE LAYER ---
     if (hazardActive) {
-      // High-frequency timing logic cycle handler
-      if (millis() - flashTimer >= hazardFlashInterval) {
-        flashTimer   = millis();
+      wasHazardActive = true;
+      uint32_t now = millis();
+
+      // Half-period toggle for front hazard lights
+      if (now - flashTimer >= hazardFlashInterval) {
+        flashTimer   = now;
         hazardToggle = !hazardToggle;
+      }
+
+      // Full-period cycle timer (ON + OFF = 2 * hazardFlashInterval) for brake-blended duty cycle
+      uint32_t fullCyclePeriod = hazardFlashInterval * 2;
+      if (now - cycleTimer >= fullCyclePeriod) {
+        cycleTimer = now;
       }
 
       bool isBraking = (currentBrakeMode == CMD_BRAKE || currentBrakeMode == CMD_EMERGENCY_BRAKE);
@@ -336,8 +353,8 @@ void hazardTask(void* pvParameters) {
         * Calculates if the running clock falls inside the solid-high window 
         * or the blinker-low release window based on brakeHazardPercent configuration maps.
         */
-        uint32_t currentPosition = (millis() - flashTimer);
-        uint32_t highWindowLimit = (uint32_t)((hazardFlashInterval * brakeHazardPercent) / 100.0f);
+        uint32_t currentPosition = (now - cycleTimer);
+        uint32_t highWindowLimit = (uint32_t)((fullCyclePeriod * brakeHazardPercent) / 100.0f);
         bool brakeDutyCycleHigh  = (currentPosition < highWindowLimit);
 
         if (brakeDutyCycleHigh) {
@@ -362,9 +379,10 @@ void hazardTask(void* pvParameters) {
     }
 
     // --- 3B. CLEAN HANDOFF / RELEASE LAYER WHEN HAZARDS TURN OFF ---
-    else {
-      // Drop front markers if no turn signal is actively claiming them
+    else if (wasHazardActive) { // <-- FIXED: Only run cleanup once on falling edge so idle loop doesn't fight other tasks
+      wasHazardActive = false;
 
+      // Drop front markers if no turn signal is actively claiming them
       if (currentTurnMode != CMD_LEFT)  FrontLeft  = false;
       if (currentTurnMode != CMD_RIGHT) FrontRight = false;
 

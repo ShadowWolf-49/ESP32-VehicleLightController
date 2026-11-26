@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <esp_task_wdt.h>
 
+Preferences calPrefs; // Local instance prevents NVS collisions
  /**
   * @brief Computes the absolute geometric 3D vector length (magnitude) from individual orthogonal components.
   * Utilizes the Euclidean 3D distance formula (Pythagorean theorem in three dimensions).
@@ -86,8 +87,9 @@ bool performSensorCalibration(){
   // Compute overall acceleration noise delta envelope to flag structural cabin movement
   float calibrationMotion = maximumMeasuredGravity - minimumMeasuredGravity;
 
-  // FIXED: Resolve orientation matrices BEFORE stripping gravity out of the raw Z vector bias
-  staticMountPitchRad = atan2(accelBiasY, accelBiasZ);
+  // Resolve orientation matrices BEFORE stripping gravity out of the raw Z vector bias
+  float dirY = (VEHICLE_Y_DIRECTION < 0.0f) ? -1.0f : 1.0f;
+  staticMountPitchRad = atan2(accelBiasY * dirY, accelBiasZ);
   staticMountPitchDeg = staticMountPitchRad * (180.0 / PI);
   vehiclePitchRad     = staticMountPitchRad; // Seed running orientation engine baseline
 
@@ -118,19 +120,20 @@ bool performSensorCalibration(){
 
   // --- 4. PERSISTENT REGISTRATION (NVS Commit) ---
   // Lock namespace partition sector maps in write-mode (false flag)
-  prefs.begin("IMU_Cal", false);
+  Preferences calPrefs; // Local instance prevents NVS collisions
+  calPrefs.begin("IMU_Cal", false);
 
-  prefs.putFloat("gravity",      measuredGravity);
-  prefs.putFloat("biasAX",       accelBiasX);
-  prefs.putFloat("biasAY",       accelBiasY);
-  prefs.putFloat("biasAZ",       accelBiasZ);
-  prefs.putFloat("biasGX",       gyroBiasX);
-  prefs.putFloat("biasGY",       gyroBiasY);
-  prefs.putFloat("biasGZ",       gyroBiasZ);
-  prefs.putFloat("vehiclePitch", vehiclePitchRad);
-  prefs.putBool("calibrated",    true);
+  calPrefs.putFloat("gravity",      measuredGravity);
+  calPrefs.putFloat("biasAX",       accelBiasX);
+  calPrefs.putFloat("biasAY",       accelBiasY);
+  calPrefs.putFloat("biasAZ",       accelBiasZ);
+  calPrefs.putFloat("biasGX",       gyroBiasX);
+  calPrefs.putFloat("biasGY",       gyroBiasY);
+  calPrefs.putFloat("biasGZ",       gyroBiasZ);
+  calPrefs.putFloat("vehiclePitch", vehiclePitchRad);
+  calPrefs.putBool("calibrated",    true);
 
-  prefs.end(); // Safely close handle and commit cache descriptors down to physical cells
+  calPrefs.end(); // Safely close handle and commit cache descriptors down to physical cells
 
   // Flush tracking filters back to default parameters to clear historical data paths
   filteredVehicleAccelY = 0.0;
@@ -194,16 +197,17 @@ void initializeMPUCalibration() {
 
     // --- 2. STORAGE SYSTEM SUBSYSTEM LOCK ---
     // Open the permanent NVS "IMU_Cal" namespace flash partition in read/write mode (false flag)
-    prefs.begin("IMU_Cal", false);
+    Preferences calPrefs; // Local instance prevents NVS collisions
+    calPrefs.begin("IMU_Cal", false);
 
     // Query validation token. Returns false if flash cells are blank or uninitialized
-    bool isCalibrated = prefs.getBool("calibrated", false);
+    bool isCalibrated = calPrefs.getBool("calibrated", false);
 
     // --- 3. DYNAMIC SEQUENCING EVALUATION ENGINE ---
     // EVALUATION STAGE A: COLD INITIALIZATION PROTOCOL (Fired when valid calibration parameters are absent)
     if (!isCalibrated) {
       // Relinquish storage partition handle early to pass control over to calibration engine safely
-      prefs.end();
+      calPrefs.end();
 
       // Execute multi-axis static chassis scan to map baseline mounting biases
       if (!performSensorCalibration()) {
@@ -220,24 +224,24 @@ void initializeMPUCalibration() {
     // EVALUATION STAGE B: WARM BOOT PROTOCOL (Restores calibrated spatial offsets from persistent non-volatile cell banks)
     else {
       // Extract structural Earth gravity constant calculated for this specific installation unit
-      measuredGravity = prefs.getFloat("gravity", 9.81); 
+      measuredGravity = calPrefs.getFloat("gravity", 9.81); 
 
       // Pull multi-axis accelerometer resting hardware drift balances from non-volatile cells
-      accelBiasX = prefs.getFloat("biasAX", 0.0);
-      accelBiasY = prefs.getFloat("biasAY", 0.0);
+      accelBiasX = calPrefs.getFloat("biasAX", 0.0);
+      accelBiasY = calPrefs.getFloat("biasAY", 0.0);
       // Fixed: Default parameter tracks relative gravity offset as an inline stability safety cushion
-      accelBiasZ = prefs.getFloat("biasAZ", 0.0); 
+      accelBiasZ = calPrefs.getFloat("biasAZ", 0.0); 
 
       // Pull multi-axis gyroscope zero-rotational biases to isolate vehicle maneuvers from drifting heading metrics
-      gyroBiasX = prefs.getFloat("biasGX", 0.0);
-      gyroBiasY = prefs.getFloat("biasGY", 0.0);
-      gyroBiasZ = prefs.getFloat("biasGZ", 0.0);
+      gyroBiasX = calPrefs.getFloat("biasGX", 0.0);
+      gyroBiasY = calPrefs.getFloat("biasGY", 0.0);
+      gyroBiasZ = calPrefs.getFloat("biasGZ", 0.0);
 
       // Extract the fixed physical module mounting pitch layout relative to the mechanical vehicle chassis frame
-      vehiclePitchRad = prefs.getFloat("vehiclePitch", 0.0);
+      vehiclePitchRad = calPrefs.getFloat("vehiclePitch", 0.0);
 
       // CONCURRENCY RELEASE: Relinquish flash memory namespace to return hardware cells back to safe idle
-      prefs.end();
+      calPrefs.end();
 
       Serial.println("[MPU] Stored calibration profiles loaded from non-volatile memory cell blocks.");
       Serial.print("[MPU] Operational parameters verified. Baseline Mount Pitch: ");
@@ -485,10 +489,13 @@ void processVehicleTelemetry(void* pvParameters) {
 
         // --- 1. DYNAMIC BRAKE MATRIX LOGIC ---
         if (brakeTrackingActive) {
+
+          float dirY = (VEHICLE_Y_DIRECTION < 0.0f) ? -1.0f : 1.0f;
+
           // Normalize accelerometer and gyro-X lines against calibration biases
-          float correctedAccelY = a.acceleration.y - accelBiasY;
+          float correctedAccelY = (a.acceleration.y - accelBiasY) * dirY;
           float correctedAccelZ = a.acceleration.z - accelBiasZ;
-          float correctedGyroX  = g.gyro.x - gyroBiasX;
+          float correctedGyroX  = (g.gyro.x - gyroBiasX) * dirY;
 
           // Calculate pitch angle using accelerometer gravity distribution
           float livePitchAccel = atan2(correctedAccelY, correctedAccelZ);

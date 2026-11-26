@@ -54,7 +54,6 @@ uint32_t PORTAL_TIMEOUT_MS       = 300000;
 // ===================================================================================
 WebServer configServer(80);
 uint32_t portalStartTime         = 0;
-Preferences prefs;
 
 uint32_t brakeStartTime          = 0;
 bool lastBrakeState              = false;
@@ -102,6 +101,7 @@ QueueHandle_t brakeToHazardQueue = NULL;
 QueueHandle_t hazardToBrakeQueue = NULL;
 QueueHandle_t turnToHazardQueue  = NULL;
 QueueHandle_t hazardToTurnQueue  = NULL;
+QueueHandle_t otaQueue           = NULL;
 
 // FreeRTOS Task Handles
 TaskHandle_t telemetryHandle     = NULL;
