@@ -1,18 +1,48 @@
 #include "relays.h"
 #include <esp_task_wdt.h>
 
+#define ALL_OVERRIDE_BITS (BIT_LIGHTING_OVERRIDE | BIT_SUPERVISOR_LOCK)
+
+// IRAM/DRAM-resident pin table so WDT ISR never touches flash cache or C++ struct pointers
+DRAM_ATTR static const uint8_t FAILSAFE_RELAY_PINS[NUM_RELAYS] = {
+  32, // FrontLeft
+  33, // FrontRight
+  25, // BackLeft
+  26, // BackRight
+  27, // HornRelay
+  14, // SpareRelay1
+  12, // SpareRelay2
+  13  // SpareRelay3
+};
+
 // Runs automatically inside the WDT interrupt right before panic/reboot
 extern "C" void IRAM_ATTR esp_task_wdt_isr_user_handler(void) {
   groundAllRelaysFailSafe();
 }
 
 /**
+  * @brief Checks whether any lighting override flag is currently active.
+  */
+static inline bool isLightingOverridden() {
+  return (systemEventGroup != NULL) &&
+         ((xEventGroupGetBits(systemEventGroup) & ALL_OVERRIDE_BITS) != 0);
+}
+/**
   * @brief Immediately grounds all physical relay outputs to a safe LOW state.
   */
-void IRAM_ATTR groundAllRelaysFailSafe() {
+void IRAM_ATTR groundAllRelays() {
   for (int i = 0; i < NUM_RELAYS; i++) {
     gpio_set_level((gpio_num_t)relays[i]->value, 0);
     relays[i]->isOn = false;
+  }
+}
+/**
+  * @brief Immediately grounds all physical relay outputs to a safe LOW state.
+  *        100% IRAM/DRAM-safe for execution inside Watchdog ISRs and flash-write panics.
+  */
+void IRAM_ATTR groundAllRelaysFailSafe() {
+  for (int i = 0; i < NUM_RELAYS; i++) {
+    gpio_set_level((gpio_num_t)FAILSAFE_RELAY_PINS[i], 0);
   }
 }
 /**
@@ -34,18 +64,20 @@ void brakeLightTask(void* pvParameters) {
   bool strobeState         = false;
   bool durationComplete    = false;
   bool brakeActive         = false;
+  bool wasOverridden   = false;
 
   // Infinite execution boundary container keeping Core 0 background OS scheduler thread fed
   for (;;) {
     // Temporary holder to check incoming message data safely without destroying running clocks
     SignalCommand incomingCmd;
+    bool overridden = isLightingOverridden();
 
     /**
     * DYNAMIC QUEUE BLOCKING STRATEGY:
     * - When IDLE (!brakeActive), block indefinitely (portMAX_DELAY) to reduce CPU load to 0%.
     * - When ACTIVE (brakeActive), poll instantly (0-timeout) to allow flasher clocks to cycle.
     */
-    uint32_t waitTime = (!brakeActive && currentHazardMode != CMD_HAZARD) ? portMAX_DELAY : 0;
+    uint32_t waitTime = (!brakeActive && currentHazardMode != CMD_HAZARD && !overridden) ? portMAX_DELAY : 0;
 
     // 1. INBOUND QUEUE DATA ACQUISITION
     if (xQueueReceive(brakeQueue, &incomingCmd, waitTime) == pdPASS) { 
@@ -72,6 +104,18 @@ void brakeLightTask(void* pvParameters) {
     xQueueReceive(turnToBrakeQueue, &currentSignalMode, 0);
     xQueueReceive(hazardToBrakeQueue, &currentHazardMode, 0);
 
+    // --- 1B. CORE 1 OVERRIDE / OTA LOCKOUT GATE ---
+    if (isLightingOverridden()) {
+      wasOverridden = true;
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    } else if (wasOverridden) {
+      wasOverridden    = false;
+      brakeStartTime   = millis();
+      flashTimer       = millis();
+      strobeState      = true;
+      durationComplete = false;
+    }
     // --- 2. HIGH-PRIORITY HAZARD INTERLOCK OVERRIDE CHECK ---
     if (currentHazardMode == CMD_HAZARD) {
       // If hazard system is actively interlocking outputs, force this task's internal
@@ -168,19 +212,21 @@ void turnSignalTask(void* pvParameters) {
   uint32_t flashTimer  = 0;     // High-resolution timestamp tracking individual blinker cadences
   bool blinkToggle     = false; // Local asynchronous logic level cache for physical relay pins
   bool turnActive      = false; // Internal tracking flag dictating dynamic queue blocking timeouts
-  bool wasTurnActive   = false; // <-- ADDED: Tracks previous active turn state for clean single-pass handoff
+  bool wasTurnActive   = false; // Tracks previous active turn state for clean single-pass handoff
+  bool wasOverridden   = false;
 
   // Infinite execution boundary container keeping Core 0 background OS scheduler thread fed
   for (;;) {
     // Temporary holder to handle incoming messages without breaking clock baselines
     SignalCommand incomingCmd;
+    bool overridden = isLightingOverridden();
 
     /**
     * DYNAMIC QUEUE BLOCKING STRATEGY:
     * - When IDLE (!turnActive and hazards off), block indefinitely (portMAX_DELAY) to drop Core 0 usage to 0%.
     * - When ACTIVE, poll instantly (0-timeout) to allow the flasher clocks to run.
     */
-    uint32_t waitTime = (!turnActive && currentHazardMode != CMD_HAZARD) ? portMAX_DELAY : 0;
+    uint32_t waitTime = (!turnActive && currentHazardMode != CMD_HAZARD && !overridden) ? portMAX_DELAY : 0;
 
     // 1. INBOUND QUEUE DATA ACQUISITION
     if (xQueueReceive(turnQueue, &incomingCmd, waitTime) == pdPASS) {
@@ -212,6 +258,18 @@ void turnSignalTask(void* pvParameters) {
     // Broadcast current turn state out to the hazard backplane immediately
     xQueueOverwrite(turnToHazardQueue, &receivedCmd);
 
+    // --- 1B. CORE 1 OVERRIDE / OTA LOCKOUT GATE ---
+    if (isLightingOverridden()) {
+      wasOverridden = true;
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    } else if (wasOverridden) {
+      wasOverridden        = false;
+      dynamicModeStartTime = millis();
+      flashTimer           = millis();
+      blinkToggle          = true;
+    }
+
     // --- 2. HIGH-PRIORITY HAZARD INTERLOCK OVERRIDE CHECK ---
     if (currentHazardMode == CMD_HAZARD) {
       // If hazard system is active, force turn signal processing to stand down.
@@ -220,7 +278,7 @@ void turnSignalTask(void* pvParameters) {
       continue;
     }
 
-    // <-- MOVED & ADDED: Compute brakeActive here so all branches below can read it
+    // Compute brakeActive here so all branches below can read it
     bool brakeActive = (currentBrakeMode == CMD_BRAKE || currentBrakeMode == CMD_EMERGENCY_BRAKE || Brake.isPressed);
     
     // --- 3. ACTIVE ASYNCHRONOUS FLASHER ENGINE ---
@@ -307,10 +365,13 @@ void hazardTask(void* pvParameters) {
   bool hazardToggle     = false;
   bool hazardActive     = false;
   bool wasHazardActive  = false;
+  bool wasOverridden    = false;
 
   for (;;) {
     SignalCommand incomingCmd;
-    uint32_t waitTime = (!hazardActive) ? portMAX_DELAY : 0;
+    bool overridden = isLightingOverridden();
+
+    uint32_t waitTime = (!hazardActive && !overridden) ? portMAX_DELAY : 0;
 
     // 1. DYNAMIC BLOCKING QUEUE PARSER
     if (xQueueReceive(hazardQueue, &incomingCmd, waitTime) == pdPASS) {
@@ -327,6 +388,18 @@ void hazardTask(void* pvParameters) {
     xQueueReceive(turnToHazardQueue, &currentTurnMode, 0);
     
     hazardActive = (receivedHazardCmd == CMD_HAZARD);
+
+    // --- 2B. CORE 1 OVERRIDE / OTA LOCKOUT GATE ---
+    if (isLightingOverridden()) {
+      wasOverridden = true;
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    } else if (wasOverridden) {
+      wasOverridden = false;
+      flashTimer    = millis();
+      cycleTimer    = millis();
+      hazardToggle  = true;
+    }
 
     // --- 3. ACTIVE HAZARD ENGINE LAYER ---
     if (hazardActive) {
@@ -413,19 +486,28 @@ void hornTask(void* pvParameters) {
   bool assertHorn = false;
 
   for (;;) {
+    bool otaLocked = (systemEventGroup != NULL) &&
+                     ((xEventGroupGetBits(systemEventGroup) & BIT_SUPERVISOR_LOCK) != 0);
+
     /**
     * DYNAMIC QUEUE BLOCKING STRATEGY:
     *  - When IDLE (!assertHorn), block indefinitely (portMAX_DELAY) to drop Core 0 CPU load to 0%.
     *  - When ACTIVE (assertHorn), poll instantly (0-timeout) to process immediate releases.
     */
-    uint32_t waitTime = (!assertHorn) ? portMAX_DELAY : 0;
+    uint32_t waitTime = (!assertHorn && !otaLocked) ? portMAX_DELAY : 0;
 
     // Drain the latest command token from the pipeline
     if (xQueueReceive(hornQueue, &assertHorn, waitTime) == pdPASS) {
-      // Execute low-impedance relay configuration instantly using your structural operator
-      HornRelay = assertHorn;
+      if (!otaLocked) {
+        // Execute low-impedance relay configuration instantly using your structural operator
+        HornRelay = assertHorn;
+      }
     }
 
+    if (otaLocked && HornRelay.isOn) {
+      HornRelay = false;
+    }
+    
     // Cooperative Concurrency Yield: Mandatory sleep to feed system hardware watchdogs on Core 0
     vTaskDelay(pdMS_TO_TICKS(10));
   }

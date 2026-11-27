@@ -20,21 +20,17 @@ void IRAM_ATTR buttonISR(void* arg) {
   if (now - btn->lastEdgeTime < DEBOUNCE_LOCKOUT) {
     return;
   }
+      btn->lastEdgeTime = now;
 
   // --- 2. ATOMIC EDGE BOUNDARY STATE TRACKING ---
-  // Evaluate the physical electrical voltage level footprint on the target pin trace
+  // Only update isPressed here; keep press/hold state tracking exclusively on Core 1
   if (digitalRead(btn->value) == LOW) {
-    // Falling Edge Transition: Mechanical contact achieved (Active-LOW switch pulling trace down)
-    if (!btn->isPressed) { 
-      btn->isPressed      = true;
-      btn->lastEdgeTime = now;
-      btn->eventTriggered = false; // Reset trigger tracking engine flags for fresh evaluation loops
+    if (!btn->isPressed) {
+      btn->isPressed = true;
     }
   } else {
-    // Rising Edge Transition: Mechanical contact released (Pull-up resistor snapping trace high)
     if (btn->isPressed) {
-      btn->isPressed      = false;
-      btn->lastEdgeTime = now;
+      btn->isPressed = false;
     }
   }
 }
@@ -90,6 +86,10 @@ void detectBrakePedal() {
 void processTurnSignalButtons() {
   uint32_t now = millis();
   
+  static bool wasPressed[2]     = {false, false};
+  static bool pressTracked[2]   = {false, false};
+  static uint32_t pressStart[2] = {0, 0};
+
   // Parallel structural translation maps pairing physical addresses to state directives
   Button* turnButtons[2]       = {&Left, &Right};
   SignalCommand triggerCmds[2] = {CMD_LEFT, CMD_RIGHT};
@@ -105,30 +105,34 @@ void processTurnSignalButtons() {
 
   // Iterate symmetrically over independent signaling channels
   for (int i = 0; i < 2; i++) {
-    Button* btn       = turnButtons[i];
+    bool isPressed    = turnButtons[i]->isPressed;
     SignalCommand cmd = triggerCmds[i];
 
     // --- 1. RISING-EDGE DETECTION: Capture initial mechanical switch compression ---
-    if (btn->isPressed && !btn->eventTriggered) {
-      btn->eventTriggered = true;
-      btn->pressStartTime = now;
+    if (isPressed && !wasPressed[i]) {
+      wasPressed[i]   = true;
+      pressTracked[i] = true;
+      pressStart[i]   = now;
     }
 
     // --- 2. FALLING-EDGE DETECTION: Capture structural switch decompression/release ---
-    if (!btn->isPressed && btn->eventTriggered) {
-      btn->eventTriggered = false; // Clear input latch to accept subsequent transitions
+    else if (!isPressed && wasPressed[i]) {
+      wasPressed[i] = false;
       
-      uint32_t holdTime = now - btn->pressStartTime;
+      // Ignore releases that were not preceded by a clean Core 1 press
+      if (!pressTracked[i]) {
+        continue;
+      }
+      pressTracked[i] = false;
+
+      uint32_t holdTime = now - pressStart[i];
       SignalCommand nextSignalMode = signalMode;
 
       // TRACK OVERRIDE OR TOGGLE DEACTIVATION (MANUAL DOUBLE-PRESS CANCEL)
       // If a driver taps an already active indicator track, interpret it as an abort command
       if (signalMode == cmd) {
         nextSignalMode = CMD_TURN_OFF;
-      } 
-      
-      // FRESH SIGNAL ACTIVATION PATHWAY
-      else {
+      } else {
         // PROFILE LEVEL A: Long Hold Profile (Infinite interlock window - e.g., structural breakdown or staging)
         if (holdTime >= HoldDurationInfinite) {
           activeTimeout = 0xFFFFFFFF; 
@@ -152,6 +156,18 @@ void processTurnSignalButtons() {
       // Only commit modifications and dispatch queue packets if a genuine state alteration occurs
       if (nextSignalMode != signalMode) {
         signalMode = nextSignalMode;
+
+        // Reset MPU yaw tracking immediately so direct Left <-> Right switches
+        // do not carry over accumulated angle from the previous turn direction
+        accumulatedYaw = 0.0;
+        turnInitiated  = false;
+
+        // Flush any stale timeout cancellation from a previous turn cycle so it cannot
+        // race with a manual double-tap or immediately cancel a newly activated turn
+        if (turnCancelQueue != NULL) {
+          xQueueReset(turnCancelQueue);
+        }
+
         xQueueOverwrite(turnQueue, &signalMode); // Dispatch master state command packet to Core 0
         
         Serial.print("[INPUT] Turn signal engine state migration committed. Target Mode ID: ");
@@ -166,32 +182,46 @@ void processTurnSignalButtons() {
   * registers and dispatch synchronized state instructions to the Core 0 hazard engine.
   */
 void processHazardButton() {
-  // Static edge-detection tracker mapping the physical state of the hardware switch
-  static bool lastHazardSwitchState = false;
+  static bool wasPressed      = false;
+  static bool comboSuppressed = false;
 
-  // --- 1. EDGE TRANSITION DETECTION LAYER ---
-  // Evaluate if the switch has undergone a physical state modification
-  if (Hazard.isPressed != lastHazardSwitchState) {
-    lastHazardSwitchState = Hazard.isPressed; // Sync the hardware tracking edge latch
-    
-    SignalCommand nextHazardMode = hazardMode;
+  bool isPressed = Hazard.isPressed;
 
-    // Map physical switch tracking directly to system state commands
-    if (lastHazardSwitchState) {
-      nextHazardMode = CMD_HAZARD;
-    } else {
-      nextHazardMode = CMD_HAZARD_OFF;
+  // Sync local edge tracker if supervisor already latched CMD_HAZARD on Light Sleep wake
+  if (hazardMode == CMD_HAZARD && isPressed && !wasPressed) {
+    wasPressed = true;
+    return;
+  }
+
+  // Guard: If Hazard + Horn portal combo is held (when ignition interlock is off),
+  // cancel any hazard activation caused by the initial press and ignore until release.
+  if (!useIgnitionInterlock && isPressed && Horn.isPressed) {
+    if (!comboSuppressed) {
+      comboSuppressed = true;
+      if (hazardMode == CMD_HAZARD) {
+        hazardMode = CMD_HAZARD_OFF;
+        xQueueOverwrite(hazardQueue, &hazardMode);
+      }
     }
+    wasPressed = true;
+    return;
+  }
 
-    // --- 2. EDGE-GATED STATE SYNCHRONIZATION ---
-    // Only execute structural alterations and queue dispatches on genuine changes
-    if (nextHazardMode != hazardMode) {
-      hazardMode = nextHazardMode;
-      xQueueOverwrite(hazardQueue, &hazardMode); // Transmit state instruction across to Core 0
-      
-      Serial.printf("[INPUT] Physical Hazard Switch transition verified. Core 1 Target State: %s\n", 
+  // Rising edge: Toggle hazard immediately on button press (matches automotive feel)
+  if (isPressed && !wasPressed) {
+    wasPressed = true;
+    if (!comboSuppressed) {
+      hazardMode = (hazardMode == CMD_HAZARD) ? CMD_HAZARD_OFF : CMD_HAZARD;
+      xQueueOverwrite(hazardQueue, &hazardMode);
+
+      Serial.printf("[INPUT] Hazard button pressed. New State: %s\n",
                     hazardMode == CMD_HAZARD ? "ACTIVE (CMD_HAZARD)" : "IDLE (CMD_HAZARD_OFF)");
     }
+  } 
+  // Falling edge: Reset latches when button is released
+  else if (!isPressed && wasPressed) {
+    wasPressed      = false;
+    comboSuppressed = false;
   }
 }
 /**
@@ -255,9 +285,10 @@ void processPortalComboButton() {
 
       // --- VISUAL FEEDBACK: Flash all 4 corner lights twice ---
       // Temporarily pause Core 0 lighting tasks so they don't fight the confirmation flash
-      if (turnTaskHandle   != NULL) vTaskSuspend(turnTaskHandle);
-      if (hazardTaskHandle != NULL) vTaskSuspend(hazardTaskHandle);
-      if (brakeTaskHandle  != NULL) vTaskSuspend(brakeTaskHandle);
+      if (systemEventGroup != NULL) {
+        xEventGroupSetBits(systemEventGroup, BIT_LIGHTING_OVERRIDE);
+        vTaskDelay(pdMS_TO_TICKS(15)); // Allow Core 0 tasks to finish current 10ms slice cleanly
+      }
 
       for (int flash = 0; flash < 2; flash++) {
         FrontLeft  = true;
@@ -273,10 +304,10 @@ void processPortalComboButton() {
         vTaskDelay(pdMS_TO_TICKS(70));
       }
 
-      // Resume Core 0 lighting tasks cleanly
-      if (turnTaskHandle   != NULL) vTaskResume(turnTaskHandle);
-      if (hazardTaskHandle != NULL) vTaskResume(hazardTaskHandle);
-      if (brakeTaskHandle  != NULL) vTaskResume(brakeTaskHandle);
+      // Release override lock so Core 0 lighting tasks resume cleanly
+      if (systemEventGroup != NULL) {
+        xEventGroupClearBits(systemEventGroup, BIT_LIGHTING_OVERRIDE);
+      }
     }
   } else {
     // Reset tracking once either button is released

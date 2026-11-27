@@ -5,6 +5,7 @@
 #include <Adafruit_MPU6050.h>
 #include <Preferences.h>
 #include <WebServer.h>
+#include <freertos/event_groups.h>
 
 // ===================================================================================
 // =======================        Hardware Constants         =========================
@@ -39,9 +40,7 @@ enum OtaEvent : uint8_t {
 struct Button {
   const uint8_t value;
   volatile bool isPressed = false;
-  volatile bool eventTriggered = false;
   uint32_t lastEdgeTime = 0;          // Exclusive to buttonISR (debounce)
-  uint32_t pressStartTime = 0;        // Exclusive to Core 1 (hold duration)
 
   operator uint8_t() const { return value; }
   operator bool() const volatile { return isPressed; }
@@ -60,14 +59,17 @@ struct Relay {
   volatile bool isOn = false;
 
   operator uint8_t() const { return value; }
-  operator bool() const volatile { return isOn; }
+  operator bool() const volatile { return digitalRead(value) == HIGH; }
   Relay& operator=(const Relay&) = delete;
 
   bool operator=(bool state) volatile {
-    if (isOn != state) {
-      isOn = state;
-      digitalWrite(value, isOn ? HIGH : LOW);
+    static portMUX_TYPE relayMux = portMUX_INITIALIZER_UNLOCKED;
+    portENTER_CRITICAL(&relayMux);
+    if ((digitalRead(value) == HIGH) != state) {
+      digitalWrite(value, state ? HIGH : LOW);
     }
+    isOn = state;
+    portEXIT_CRITICAL(&relayMux);
     return isOn;
   }
 };
@@ -162,6 +164,11 @@ extern float staticMountPitchDeg;
 extern float vehiclePitchRad;
 extern uint32_t lastUpdateTime;
 extern float filteredVehicleAccelY;
+
+// FreeRTOS Event Groups
+#define BIT_LIGHTING_OVERRIDE (1 << 0)
+#define BIT_SUPERVISOR_LOCK   (1 << 1)
+extern EventGroupHandle_t systemEventGroup;
 
 // FreeRTOS Queues
 extern QueueHandle_t brakeQueue;

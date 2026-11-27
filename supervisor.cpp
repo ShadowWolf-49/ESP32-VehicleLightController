@@ -74,6 +74,11 @@ void processSystemInterlockSupervisor(void* pvParameters) {
       if (incomingOtaEvent == OTA_EVENT_START) {
         otaInProgress = true;
 
+        // Lock out Core 0 relay tasks cleanly without vTaskSuspend
+        if (systemEventGroup != NULL) {
+          xEventGroupSetBits(systemEventGroup, BIT_SUPERVISOR_LOCK);
+        }
+
         // Unsubscribe all WDTs BEFORE suspending the tasks
         setTaskWdt(telemetryHandle, telemetryWdtActive, false);
         setTaskWdt(inputTaskHandle, inputWdtActive,     false);
@@ -82,16 +87,18 @@ void processSystemInterlockSupervisor(void* pvParameters) {
         safeSuspend(telemetryHandle);
         safeSuspend(inputTaskHandle);
         safeSuspend(core0WdtHandle);
-        safeSuspend(brakeTaskHandle);
-        safeSuspend(turnTaskHandle);
-        safeSuspend(hazardTaskHandle);
-        safeSuspend(hornTaskHandle);
         safeSuspend(diagnosticsTaskHandle);
 
+        // Wait 15ms so Core 0 relay tasks finish any in-progress loop slice cleanly
+        vTaskDelay(pdMS_TO_TICKS(15));
+
         // Ground all relays immediately
-        groundAllRelaysFailSafe();
+        groundAllRelays();
       } else if (incomingOtaEvent == OTA_EVENT_ABORT) {
         otaInProgress = false;
+        if (systemEventGroup != NULL) {
+          xEventGroupClearBits(systemEventGroup, BIT_SUPERVISOR_LOCK);
+        }
         activeStateProfile = 0; // Force supervisor to re-apply current state & resume tasks
       }
     }
@@ -135,11 +142,18 @@ void processSystemInterlockSupervisor(void* pvParameters) {
         if (leftHeld && rightHeld) {
           Serial.println("[SUPERVISOR] Hidden Calibration Sequence Triggered via Multi-Button Hold!");
           
-          // Ensure Core 0 lighting tasks are suspended before manual visual feedback
-          safeSuspend(turnTaskHandle);
-          safeSuspend(hazardTaskHandle);
-          safeSuspend(brakeTaskHandle);
+          // Unsubscribe WDTs & suspend competing Core 1 tasks BEFORE long blocking calibration
+          // (Prevents 3-second WDT timeout during State 2 -> State 1 transition)
+          setTaskWdt(telemetryHandle, telemetryWdtActive, false);
+          setTaskWdt(inputTaskHandle, inputWdtActive,     false);
+          safeSuspend(telemetryHandle);
+          safeSuspend(inputTaskHandle);
 
+          // Lock Core 0 lighting tasks cleanly before manual visual feedback
+          if (systemEventGroup != NULL) {
+            xEventGroupSetBits(systemEventGroup, BIT_SUPERVISOR_LOCK);
+            vTaskDelay(pdMS_TO_TICKS(15));
+          }
 
           // Ground light arrays to prevent visual strobe flickering during calibration
           FrontLeft  = false;
@@ -175,12 +189,11 @@ void processSystemInterlockSupervisor(void* pvParameters) {
             mpuBrakeAvailable     = false; 
             Serial.println("[SUPERVISOR] Manual recalibration FAILED. Check chasis stability.");
           }
-
-          // Re-suspend Core 0 lighting tasks in case performSensorCalibration() resumed them;
-          // Case 1 below will perform the clean, synchronized resume.
-          safeSuspend(turnTaskHandle);
-          safeSuspend(hazardTaskHandle);
-          safeSuspend(brakeTaskHandle);
+          
+          // Always release lock even if calibration failed
+          if (systemEventGroup != NULL) {
+            xEventGroupClearBits(systemEventGroup, BIT_SUPERVISOR_LOCK);
+          }
         }
       }
 
@@ -193,6 +206,9 @@ void processSystemInterlockSupervisor(void* pvParameters) {
         // ==========================================================================
         case 1:
           Serial.println("[SUPERVISOR] Profile 1: Full System Activation. Resuming all cores...");
+
+          // Launch 5-minute Wi-Fi config portal whenever Ignition turns ON
+          startWebPortal();
 
           // Wake the physical MPU6050 register infrastructure up if available
           if (mpuAvailable) {
@@ -209,6 +225,11 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           safeResume(hornTaskHandle);
           safeResume(diagnosticsTaskHandle);
           safeResume(core0WdtHandle);
+
+          // Release supervisor lock so Core 0 relay tasks resume normal operation
+          if (systemEventGroup != NULL) {
+            xEventGroupClearBits(systemEventGroup, BIT_SUPERVISOR_LOCK);
+          }
 
           // Subscribe all resumed tasks to the Hardware Watchdog
           setTaskWdt(telemetryHandle, telemetryWdtActive, true);
@@ -227,39 +248,41 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           // Shut down Wi-Fi portal if it was still running when key turned off
           stopWebPortal();
 
+          // Ensure supervisor lock is released so hazardTask runs freely
+          if (systemEventGroup != NULL) {
+            xEventGroupClearBits(systemEventGroup, BIT_SUPERVISOR_LOCK);
+          }
+
           // Unsubscribe telemetry WDT BEFORE suspending the task
           setTaskWdt(telemetryHandle, telemetryWdtActive, false);
 
-          // Freeze background evaluation engines and telemetry loops to preserve vehicle battery
+          // Freeze background telemetry & diagnostics loops to preserve vehicle battery
+          // (Core 0 turn, brake, and horn tasks are NOT suspended—they block at 0% CPU on portMAX_DELAY)
           safeSuspend(telemetryHandle);
-          safeSuspend(brakeTaskHandle);
-          safeSuspend(turnTaskHandle);
-          safeSuspend(hornTaskHandle);
           safeSuspend(diagnosticsTaskHandle);
 
-          // Ensure human interface input loop stays alive on Core 1 to catch the hazard shutoff tap
+          // Ensure Core 0 relay tasks & Core 1 input loop are awake
+          safeResume(brakeTaskHandle);
+          safeResume(turnTaskHandle);
+          safeResume(hornTaskHandle);
           safeResume(inputTaskHandle);
           safeResume(core0WdtHandle);
           safeResume(hazardTaskHandle);
 
           // Flush volatile turn and brake variables down to safe default definitions
-          signalMode = CMD_TURN_OFF;
-          brakeMode  = CMD_BRAKE_OFF;
-          // Clear stale MPU brake latCH
+          signalMode     = CMD_TURN_OFF;
+          brakeMode      = CMD_BRAKE_OFF;
           mpuBrakeActive = false;
           
           {
             SignalCommand flushTurn  = CMD_TURN_OFF;
             SignalCommand flushBrake = CMD_BRAKE_OFF;
+            bool flushHorn           = false;
             xQueueOverwrite(turnQueue,  &flushTurn);
             xQueueOverwrite(brakeQueue, &flushBrake);
+            xQueueOverwrite(hornQueue,  &flushHorn);
+            if (turnCancelQueue != NULL) xQueueReset(turnCancelQueue);
           }
-
-          // Drop combination light relays low to prevent background line bleed before hazard override
-          FrontLeft  = false;
-          FrontRight = false;
-          BackLeft   = false;
-          BackRight  = false;
 
           // Subscribe all resumed tasks to the Hardware Watchdog
           setTaskWdt(inputTaskHandle, inputWdtActive, true);
@@ -279,15 +302,47 @@ void processSystemInterlockSupervisor(void* pvParameters) {
         case 3:
           Serial.println("[SUPERVISOR] Profile 3: Complete Idle. Commencing deep system shutdown...");
 
-          // Shut down Wi-Fi portal if it was still running when key turned off
+          // Shut down Wi-Fi portal and wait for its task to turn off the radio & self-delete
           stopWebPortal();
+          {
+            uint32_t wifiShutdownStart = millis();
+            while (webPortalTaskHandle != NULL && (millis() - wifiShutdownStart < 500)) {
+              vTaskDelay(pdMS_TO_TICKS(10)); // Yield Core 1 so Priority 1 webConfigPortalTask can exit cleanly
+            }
+          }
+
+          // Ensure supervisor lock is cleared before state teardown
+          if (systemEventGroup != NULL) {
+            xEventGroupClearBits(systemEventGroup, BIT_SUPERVISOR_LOCK);
+          }
+
+          // 1. Reset internal software states & flush queues FIRST so Core 0 tasks settle cleanly into idle
+          signalMode     = CMD_TURN_OFF;
+          brakeMode      = CMD_BRAKE_OFF;
+          hazardMode     = CMD_HAZARD_OFF;
+          mpuBrakeActive = false;
+          
+          {
+            SignalCommand cleanTurn   = CMD_TURN_OFF;
+            SignalCommand cleanBrake  = CMD_BRAKE_OFF;
+            SignalCommand cleanHazard = CMD_HAZARD_OFF;
+            bool cleanHorn            = false;
+            xQueueOverwrite(turnQueue,   &cleanTurn);
+            xQueueOverwrite(brakeQueue,  &cleanBrake);
+            xQueueOverwrite(hazardQueue, &cleanHazard);
+            xQueueOverwrite(hornQueue,   &cleanHorn);
+            if (turnCancelQueue != NULL) xQueueReset(turnCancelQueue);
+          }
+
+          // Allow 15ms for Core 0 tasks to drain queues and enter portMAX_DELAY idle cleanly
+          vTaskDelay(pdMS_TO_TICKS(15));
 
           // Unsubscribe all WDTs BEFORE suspending the tasks
           setTaskWdt(telemetryHandle, telemetryWdtActive, false);
           setTaskWdt(inputTaskHandle, inputWdtActive,     false);
           setTaskWdt(core0WdtHandle,  core0WdtActive,     false);
 
-          // 1. Thread Teardown Strategy: Suspend processing loops across both execution cores
+          // 2. Thread Teardown Strategy: Suspend now-idle loops across both execution cores
           safeSuspend(telemetryHandle);
           safeSuspend(inputTaskHandle);
           safeSuspend(core0WdtHandle);
@@ -297,26 +352,13 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           safeSuspend(hornTaskHandle);
           safeSuspend(diagnosticsTaskHandle);
 
-          // 2. Hardware Safety Isolation: Ground output channels to protect against continuous battery drain
-          groundAllRelaysFailSafe();
+          // 3. Hardware Safety Isolation: Ground output channels to protect against continuous battery drain
+          groundAllRelays();
 
-          // 3. Sensor Hibernation Block: Place MPU6050 register tracks into sleep mode
+          // 4. Sensor Hibernation Block: Place MPU6050 register tracks into sleep mode
           if (mpuAvailable) {
             mpu.enableSleep(true);
             Serial.println("[SUPERVISOR] MPU6050 internal registers placed into standby power levels.");
-          }
-
-          // 4. Reset internal software states down to clean base assumptions
-          signalMode = CMD_TURN_OFF;
-          brakeMode  = CMD_BRAKE_OFF;
-          // Clear stale MPU brake latch
-          mpuBrakeActive = false;
-          
-          {
-            SignalCommand cleanTurn  = CMD_TURN_OFF;
-            SignalCommand cleanBrake = CMD_BRAKE_OFF;
-            xQueueOverwrite(turnQueue,  &cleanTurn);
-            xQueueOverwrite(brakeQueue, &cleanBrake);
           }
 
           Serial.println("[SUPERVISOR] System clean teardown complete. Core 1 entering Light Sleep block...");
@@ -336,6 +378,9 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           esp_light_sleep_start();
 
           // 6. POST-SLEEP RECOVERY INTERLOCK LOGIC
+          // Capture wake GPIO wake source
+          esp_sleep_wakeup_cause_t wakeupReason = esp_sleep_get_wakeup_cause();
+
           // Disable GPIO wakeup triggers so level interrupts don't re-fire during active runtime
           gpio_wakeup_disable((gpio_num_t)Ignition.value);
           gpio_wakeup_disable((gpio_num_t)Hazard.value);
@@ -348,6 +393,13 @@ void processSystemInterlockSupervisor(void* pvParameters) {
           // Sync volatile ISR flags with current physical pin states after wake-up
           Ignition.isPressed = (digitalRead(Ignition.value) == LOW);
           Hazard.isPressed   = (digitalRead(Hazard.value)   == LOW);
+
+          // If GPIO woke the ESP32 and Ignition is OFF, the momentary Hazard button triggered the wakeup
+          if (wakeupReason == ESP_SLEEP_WAKEUP_GPIO && !Ignition.isPressed) {
+            hazardMode = CMD_HAZARD;
+            xQueueOverwrite(hazardQueue, &hazardMode);
+            Serial.println("[SUPERVISOR] Woke via momentary Hazard button. Latching CMD_HAZARD.");
+          }
 
           Serial.println("[SUPERVISOR] Core waking up from low power sleep track. Re-evaluating profiles...");
 

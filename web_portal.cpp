@@ -1,9 +1,15 @@
 #include "web_portal.h"
 #include "storage.h"
 #include "mpu_sensor.h"
+#include "relays.h"
 #include <WiFi.h>
+#include <DNSServer.h>
 #include <Update.h>
 #include <esp_task_wdt.h>
+
+
+static const byte DNS_PORT = 53;
+static DNSServer dnsServer;
 
 // Thread-safe shutdown flag so webConfigPortalTask always self-deletes cleanly
 static volatile bool portalStopRequested = false;
@@ -11,7 +17,9 @@ static volatile bool portalStopRequested = false;
   * @brief Builds the live AJAX-enabled diagnostics webpage with real-time relay badges.
   */
 String buildDiagnosticsHTML() {
-  String html = F("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+  String html;
+  html.reserve(6400);
+  html += F("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<title>Live System Diagnostics</title><style>"
                   "body{font-family:Arial,sans-serif;background:#121212;color:#eee;margin:0;padding:15px;}"
                   "h2{color:#4db8ff;margin-bottom:5px;}h3{color:#ffcc00;border-bottom:1px solid #333;padding-bottom:4px;margin-top:20px;}"
@@ -82,6 +90,7 @@ String buildDiagnosticsHTML() {
   addRow("hazardTask (Core 0)", "stkHaz");
   addRow("brakeLightTask (Core 0)", "stkBrake");
   addRow("hornTask (Core 0)", "stkHorn");
+  addRow("core0WatchdogTask (Core 0)", "stkWdt0");
   html += F("</div>");
 
   // --- 4. LIVE SYSTEM STATES ---
@@ -156,6 +165,7 @@ String buildDiagnosticsHTML() {
             "    setVal('stkHaz', d.stkHaz, d.stkHazWarn);"
             "    setVal('stkBrake', d.stkBrake, d.stkBrakeWarn);"
             "    setVal('stkHorn', d.stkHorn, d.stkHornWarn);"
+            "    setVal('stkWdt0', d.stkWdt0, d.stkWdt0Warn);"
             "    setVal('ign', d.ign); setVal('turn', d.turn);"
             "    setVal('brake', d.brake); setVal('hazard', d.hazard);"
             "    setVal('mpuLatch', d.mpuLatch);"
@@ -179,7 +189,9 @@ String buildConfigHTML(String statusBanner) {
   uint32_t elapsed = millis() - portalStartTime;
   uint32_t remSec  = (elapsed < PORTAL_TIMEOUT_MS) ? (PORTAL_TIMEOUT_MS - elapsed) / 1000 : 0;
 
-  String html = F("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+  String html;
+  html.reserve(10240);
+  html += F("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<title>Vehicle Light Controller</title><style>"
                   "body{font-family:Arial,sans-serif;background:#121212;color:#eee;margin:0;padding:15px;}"
                   "h2{color:#4db8ff;margin-bottom:5px;}h3{color:#ffcc00;border-bottom:1px solid #333;padding-bottom:4px;margin-top:20px;}"
@@ -288,7 +300,8 @@ String buildConfigHTML(String statusBanner) {
             "<button type='submit' style='width:100%;background:#e65100;color:#fff;'>Reboot Controller</button>"
             "</form>"
             "</div>"
-             "<h3>Firmware Update (OTA)</h3>"
+            "<h3>Firmware Update (OTA)</h3>"
+            "<p style='font-size:0.8em;color:#888;margin-top:4px;'>Note: If your phone&apos;s captive Wi-Fi popup blocks file selection, open <b>http://192.168.4.1</b> directly in Safari or Chrome.</p>"
             "<form id='otaForm' action='/update' method='POST' enctype='multipart/form-data' style='margin-bottom:25px;'>"
             "<div class='row' style='gap:10px;'>"
             "<input type='file' id='otaFile' name='firmware' accept='.bin' required style='flex:1;color:#ccc;'>"
@@ -365,7 +378,9 @@ String buildAboutHTML() {
   uint32_t elapsed = millis() - portalStartTime;
   uint32_t remSec  = (elapsed < PORTAL_TIMEOUT_MS) ? (PORTAL_TIMEOUT_MS - elapsed) / 1000 : 0;
 
-  String html = F("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+  String html;
+  html.reserve(4600);
+  html += F("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<title>About - Vehicle Light Controller</title><style>"
                   "body{font-family:Arial,sans-serif;background:#121212;color:#eee;margin:0;padding:15px;line-height:1.45;}"
                   "h2{color:#4db8ff;margin-bottom:5px;}h3{color:#ffcc00;border-bottom:1px solid #333;padding-bottom:4px;margin-top:20px;}"
@@ -416,10 +431,10 @@ String buildAboutHTML() {
   // --- REPOSITORY & LICENSING ---
   html += F("<h3>Repository &amp; Licensing</h3><div class='card'>"
             "<p><b>GitHub Repository:</b><br>"
-            "<a href='https://github.com' target='_blank' rel='noopener'>"
-            "https://github.com</a></p>"
+            "<a href='https://github.com/ShadowWolf-49/ESP32-VehicleLightController' target='_blank' rel='noopener'>"
+            "https://github.com/ShadowWolf-49/ESP32-VehicleLightController</a></p>"
             "<p><b>License Type:</b> GNU Affero General Public License v3.0 (AGPL-3.0)<br>"
-            "<a href='https://github.com/blob/main/LICENSE' target='_blank' rel='noopener'>"
+            "<a href='https://github.com' target='_blank' rel='noopener'>"
             "Read full license terms &rarr;</a></p>"
             "</div>");
 
@@ -435,72 +450,100 @@ String buildAboutHTML() {
   * @brief Serves lightweight JSON telemetry and memory data for live AJAX updates.
   */
 void handleDiagnosticsJSON() {
+  static char json[1536];
+  size_t pos = 0;
+
   uint32_t elapsed  = millis() - portalStartTime;
   uint32_t remSec   = (elapsed < PORTAL_TIMEOUT_MS) ? (PORTAL_TIMEOUT_MS - elapsed) / 1000 : 0;
   uint32_t freeHeap = ESP.getFreeHeap();
 
-  auto getStackStr = [](TaskHandle_t handle) -> String {
-    if (handle == NULL) return "\"Disabled\"";
-    UBaseType_t w = uxTaskGetStackHighWaterMark(handle);
-    return "\"" + String(w) + " words (" + String(w * 4) + " B)\"";
+  auto appendFmt = [&](const char* fmt, ...) {
+    if (pos >= sizeof(json)) return;
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(json + pos, sizeof(json) - pos, fmt, args);
+    va_end(args);
+    if (written > 0) {
+      pos += (size_t)written;
+      if (pos >= sizeof(json)) pos = sizeof(json) - 1;
+    }
   };
 
-  auto getStackWarn = [](TaskHandle_t handle) -> String {
-    if (handle == NULL) return "false";
-    return (uxTaskGetStackHighWaterMark(handle) < 150) ? "true" : "false";
+  auto appendStack = [&](const char* key, const char* warnKey, TaskHandle_t handle) {
+    if (handle == NULL) {
+      appendFmt("\"%s\":\"Disabled\",\"%s\":false,", key, warnKey);
+    } else {
+      UBaseType_t w = uxTaskGetStackHighWaterMark(handle);
+      appendFmt("\"%s\":\"%u words (%u B)\",\"%s\":%s,",
+                key, (unsigned)w, (unsigned)(w * 4), warnKey, (w < 150) ? "true" : "false");
+    }
   };
 
-  String json = "{";
-  json += "\"remTime\":\"" + String(remSec / 60) + "m " + String(remSec % 60) + "s\",";
-  json += "\"uptime\":\"" + String(millis() / 1000) + "s\",";
-  json += "\"heap\":\"" + String(freeHeap) + " bytes\",";
-  json += "\"heapWarn\":" + String(freeHeap < 20000 ? "true" : "false") + ",";
+  const char* turnStr  = (signalMode == CMD_LEFT) ? "LEFT" : ((signalMode == CMD_RIGHT) ? "RIGHT" : "OFF");
+  const char* brakeStr = (brakeMode == CMD_EMERGENCY_BRAKE) ? "EMERGENCY" : ((brakeMode == CMD_BRAKE) ? "ACTIVE" : "OFF");
 
-  json += "\"stkTelem\":" + getStackStr(telemetryHandle) + ",\"stkTelemWarn\":" + getStackWarn(telemetryHandle) + ",";
-  json += "\"stkInput\":" + getStackStr(inputTaskHandle) + ",\"stkInputWarn\":" + getStackWarn(inputTaskHandle) + ",";
-  json += "\"stkPortal\":" + getStackStr(webPortalTaskHandle) + ",\"stkPortalWarn\":" + getStackWarn(webPortalTaskHandle) + ",";
-  json += "\"stkTurn\":" + getStackStr(turnTaskHandle) + ",\"stkTurnWarn\":" + getStackWarn(turnTaskHandle) + ",";
-  json += "\"stkHaz\":" + getStackStr(hazardTaskHandle) + ",\"stkHazWarn\":" + getStackWarn(hazardTaskHandle) + ",";
-  json += "\"stkBrake\":" + getStackStr(brakeTaskHandle) + ",\"stkBrakeWarn\":" + getStackWarn(brakeTaskHandle) + ",";
-  json += "\"stkHorn\":" + getStackStr(hornTaskHandle) + ",\"stkHornWarn\":" + getStackWarn(hornTaskHandle) + ",";
+  appendFmt("{\"remTime\":\"%um %us\",\"uptime\":\"%us\",\"heap\":\"%u bytes\",\"heapWarn\":%s,",
+            (unsigned)(remSec / 60), (unsigned)(remSec % 60),
+            (unsigned)(millis() / 1000),
+            (unsigned)freeHeap,
+            (freeHeap < 20000) ? "true" : "false");
 
-  json += "\"ign\":\"" + String(ignitionMode == CMD_IGNITION_ON ? "ON" : "OFF") + "\",";
-  json += "\"turn\":\"" + String(signalMode == CMD_LEFT ? "LEFT" : (signalMode == CMD_RIGHT ? "RIGHT" : "OFF")) + "\",";
-  json += "\"brake\":\"" + String(brakeMode == CMD_EMERGENCY_BRAKE ? "EMERGENCY" : (brakeMode == CMD_BRAKE ? "ACTIVE" : "OFF")) + "\",";
-  json += "\"hazard\":\"" + String(hazardMode == CMD_HAZARD ? "ACTIVE" : "OFF") + "\",";
-  json += "\"mpuLatch\":\"" + String(mpuBrakeActive ? "ENGAGED" : "IDLE") + "\",";
+  appendStack("stkTelem",  "stkTelemWarn",  telemetryHandle);
+  appendStack("stkInput",  "stkInputWarn",  inputTaskHandle);
+  appendStack("stkPortal", "stkPortalWarn", webPortalTaskHandle);
+  appendStack("stkTurn",   "stkTurnWarn",   turnTaskHandle);
+  appendStack("stkHaz",    "stkHazWarn",    hazardTaskHandle);
+  appendStack("stkBrake",  "stkBrakeWarn",  brakeTaskHandle);
+  appendStack("stkHorn",   "stkHornWarn",   hornTaskHandle);
+  appendStack("stkWdt0",   "stkWdt0Warn",   core0WdtHandle);
 
-  json += "\"mpuOnline\":\"" + String(mpuAvailable ? "ONLINE" : "OFFLINE") + "\",";
-  json += "\"mpuOnlineWarn\":" + String(!mpuAvailable ? "true" : "false") + ",";
-  json += "\"mpuBrakeRdy\":\"" + String(mpuBrakeAvailable ? "READY" : "DISABLED") + "\",";
-  json += "\"mpuBrakeWarn\":" + String(!mpuBrakeAvailable ? "true" : "false") + ",";
-  json += "\"pitch\":\"" + String(vehiclePitchRad * (180.0 / PI), 2) + " deg\",";
-  json += "\"accelY\":\"" + String(filteredVehicleAccelY, 3) + " m/s\\u00B2\",";
-  json += "\"grav\":\"" + String(measuredGravity, 4) + " m/s\\u00B2\",";
-  json += "\"biasA\":\"" + String(accelBiasX, 3) + ", " + String(accelBiasY, 3) + ", " + String(accelBiasZ, 3) + "\",";
-  json += "\"biasG\":\"" + String(gyroBiasX, 4) + ", " + String(gyroBiasY, 4) + ", " + String(gyroBiasZ, 4) + "\",";
+  appendFmt("\"ign\":\"%s\",\"turn\":\"%s\",\"brake\":\"%s\",\"hazard\":\"%s\",\"mpuLatch\":\"%s\",",
+            (ignitionMode == CMD_IGNITION_ON) ? "ON" : "OFF",
+            turnStr,
+            brakeStr,
+            (hazardMode == CMD_HAZARD) ? "ACTIVE" : "OFF",
+            mpuBrakeActive ? "ENGAGED" : "IDLE");
 
-  // Live Hardware Relay States
-  json += "\"rFL\":" + String(FrontLeft.isOn ? "true" : "false") + ",";
-  json += "\"rFR\":" + String(FrontRight.isOn ? "true" : "false") + ",";
-  json += "\"rBL\":" + String(BackLeft.isOn ? "true" : "false") + ",";
-  json += "\"rBR\":" + String(BackRight.isOn ? "true" : "false") + ",";
-  json += "\"rHorn\":" + String(HornRelay.isOn ? "true" : "false") + ",";
-  json += "\"rSp1\":" + String(SpareRelay1.isOn ? "true" : "false") + ",";
-  json += "\"rSp2\":" + String(SpareRelay2.isOn ? "true" : "false") + ",";
-  json += "\"rSp3\":" + String(SpareRelay3.isOn ? "true" : "false") + ",";
+  appendFmt("\"mpuOnline\":\"%s\",\"mpuOnlineWarn\":%s,\"mpuBrakeRdy\":\"%s\",\"mpuBrakeWarn\":%s,",
+            mpuAvailable ? "ONLINE" : "OFFLINE",
+            !mpuAvailable ? "true" : "false",
+            mpuBrakeAvailable ? "READY" : "DISABLED",
+            !mpuBrakeAvailable ? "true" : "false");
+
+  appendFmt("\"pitch\":\"%.2f deg\",\"accelY\":\"%.3f m/s\\u00B2\",\"grav\":\"%.4f m/s\\u00B2\",",
+            vehiclePitchRad * (180.0f / PI),
+            filteredVehicleAccelY,
+            measuredGravity);
+
+  appendFmt("\"biasA\":\"%.3f, %.3f, %.3f\",\"biasG\":\"%.4f, %.4f, %.4f\",",
+            accelBiasX, accelBiasY, accelBiasZ,
+            gyroBiasX, gyroBiasY, gyroBiasZ);
+
+
+  // Live Hardware Relay States (reads actual hardware GPIO state)
+  appendFmt("\"rFL\":%s,\"rFR\":%s,\"rBL\":%s,\"rBR\":%s,"
+            "\"rHorn\":%s,\"rSp1\":%s,\"rSp2\":%s,\"rSp3\":%s,",
+            (bool)FrontLeft   ? "true" : "false",
+            (bool)FrontRight  ? "true" : "false",
+            (bool)BackLeft    ? "true" : "false",
+            (bool)BackRight   ? "true" : "false",
+            (bool)HornRelay   ? "true" : "false",
+            (bool)SpareRelay1 ? "true" : "false",
+            (bool)SpareRelay2 ? "true" : "false",
+            (bool)SpareRelay3 ? "true" : "false");
 
   // Live Hardware Button Input States
-  json += "\"bLeft\":" + String(Left.isPressed ? "true" : "false") + ",";
-  json += "\"bRight\":" + String(Right.isPressed ? "true" : "false") + ",";
-  json += "\"bHaz\":" + String(Hazard.isPressed ? "true" : "false") + ",";
-  json += "\"bHorn\":" + String(Horn.isPressed ? "true" : "false") + ",";
-  json += "\"bBrake\":" + String(Brake.isPressed ? "true" : "false") + ",";
-  json += "\"bIgn\":" + String(Ignition.isPressed ? "true" : "false") + ",";
-  json += "\"bSp1\":" + String(SpareButton1.isPressed ? "true" : "false") + ",";
-  json += "\"bSp2\":" + String(SpareButton2.isPressed ? "true" : "false");
+  appendFmt("\"bLeft\":%s,\"bRight\":%s,\"bHaz\":%s,\"bHorn\":%s,"
+            "\"bBrake\":%s,\"bIgn\":%s,\"bSp1\":%s,\"bSp2\":%s}",
+            Left.isPressed         ? "true" : "false",
+            Right.isPressed        ? "true" : "false",
+            Hazard.isPressed       ? "true" : "false",
+            Horn.isPressed         ? "true" : "false",
+            Brake.isPressed        ? "true" : "false",
+            Ignition.isPressed     ? "true" : "false",
+            SpareButton1.isPressed ? "true" : "false",
+            SpareButton2.isPressed ? "true" : "false");
 
-  json += "}";
   configServer.send(200, "application/json", json);
 }
 /**
@@ -594,10 +637,7 @@ void handleRebootPage() {
   vTaskDelay(pdMS_TO_TICKS(500)); // Allow TCP packet to finish transmitting to browser
 
   // Ground all physical relay outputs before resetting
-  for (int i = 0; i < NUM_RELAYS; i++) {
-    digitalWrite(relays[i]->value, LOW);
-    relays[i]->isOn = false;
-  }
+  groundAllRelays();
 
   Serial.flush();
   ESP.restart();
@@ -694,6 +734,7 @@ void handleOtaUpload() {
       Serial.printf("[OTA] Update successful: %u bytes written.\n", upload.totalSize);
     } else {
       Update.printError(Serial);
+      otaRejected = true; // Prevent UPLOAD_FILE_ABORTED from double-aborting
 
       // Restore normal vehicle operation if final verification fails
       if (otaQueue != NULL) {
@@ -792,6 +833,14 @@ void handleRootPage() {
   configServer.send(200, "text/html", buildConfigHTML());
 }
 /**
+  * @brief Redirects OS connectivity checks and unknown URLs to the root config page
+  *        to trigger automatic Captive Portal popups on phones and laptops.
+  */
+void handleCaptiveRedirect() {
+  configServer.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
+  configServer.send(302, "text/plain", "");
+}
+/**
   * @brief Core 1 FreeRTOS task that hosts the Wi-Fi AP and Web Server for 5 minutes,
   *        then shuts down Wi-Fi and deletes itself to save power and memory.
   * 
@@ -803,7 +852,12 @@ void webConfigPortalTask(void* pvParameters) {
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID.c_str(), AP_PASS.c_str());
+  vTaskDelay(pdMS_TO_TICKS(100)); // Brief delay so SoftAP IP (192.168.4.1) initializes cleanly
   portalStartTime = millis();
+
+  // Start Captive Portal DNS server (redirects all domain lookups to 192.168.4.1)
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
 
   configServer.on("/", HTTP_GET, handleRootPage);
   configServer.on("/save", HTTP_POST, handleSavePage);
@@ -814,10 +868,12 @@ void webConfigPortalTask(void* pvParameters) {
   configServer.on("/diagnostics", HTTP_GET, handleDiagnosticsPage);
   configServer.on("/diag-data", HTTP_GET, handleDiagnosticsJSON);
   configServer.on("/about", HTTP_GET, handleAboutPage);
+  // Catch-all for OS captive portal detection URLs (/generate_204, /hotspot-detect.html, etc.)
+  configServer.onNotFound(handleCaptiveRedirect);
   configServer.begin();
 
   Serial.println("=========================================================");
-  Serial.printf("[PORTAL] Wi-Fi Config Portal Active for 5 Minutes!\n");
+  Serial.printf("[PORTAL] Captive Wi-Fi Config Portal Active for 5 Minutes!\n");
   Serial.printf("[PORTAL] SSID: %s | Password: %s\n", AP_SSID.c_str(), AP_PASS.c_str());
   Serial.print("[PORTAL] Open browser to: http://");
   Serial.println(WiFi.softAPIP());
@@ -836,6 +892,8 @@ void webConfigPortalTask(void* pvParameters) {
     Serial.println("[PORTAL] 5-minute window expired. Shutting down Wi-Fi portal...");
   }
 
+  // Stop DNS server before tearing down SoftAP
+  dnsServer.stop(); 
   configServer.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);

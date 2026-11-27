@@ -3,7 +3,8 @@
 
 #include "config.h"
 
-void groundAllRelaysFailSafe();
+void groundAllRelaysFailSafe(); // IRAM-safe for WDT ISR only
+void groundAllRelays();         // Task-level safe shutdown (updates .isOn)
 void brakeLightTask(void* pvParameters);
 void turnSignalTask(void* pvParameters);
 void hazardTask(void* pvParameters);

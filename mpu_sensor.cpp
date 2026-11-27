@@ -2,7 +2,6 @@
 #include <Wire.h>
 #include <esp_task_wdt.h>
 
-Preferences calPrefs; // Local instance prevents NVS collisions
  /**
   * @brief Computes the absolute geometric 3D vector length (magnitude) from individual orthogonal components.
   * Utilizes the Euclidean 3D distance formula (Pythagorean theorem in three dimensions).
@@ -144,10 +143,11 @@ bool performSensorCalibration(){
   Serial.println("[CALIBRATION] 6-Axis spatial transformation profile committed permanently to memory.");
 
   // VISUAL FEEDBACK INTERLOCK: Flash all 4 corner indicators simultaneously 3 times to confirm calibration success
-      // Temporarily pause Core 0 lighting tasks so they don't fight the confirmation flash
-  if (turnTaskHandle   != NULL) vTaskSuspend(turnTaskHandle);
-  if (hazardTaskHandle != NULL) vTaskSuspend(hazardTaskHandle);
-  if (brakeTaskHandle  != NULL) vTaskSuspend(brakeTaskHandle);
+  // Temporarily pause Core 0 lighting tasks so they don't fight the confirmation flash
+  if (systemEventGroup != NULL) {
+    xEventGroupSetBits(systemEventGroup, BIT_LIGHTING_OVERRIDE);
+    vTaskDelay(pdMS_TO_TICKS(15)); // Allow Core 0 tasks to finish current 10ms slice cleanly
+  }
 
   for (int flash = 0; flash < 3; flash++) {
     FrontLeft  = true;
@@ -165,10 +165,10 @@ bool performSensorCalibration(){
     vTaskDelay(pdMS_TO_TICKS(70));
   }
 
-    // Resume Core 0 lighting tasks cleanly
-  if (turnTaskHandle   != NULL) vTaskResume(turnTaskHandle);
-  if (hazardTaskHandle != NULL) vTaskResume(hazardTaskHandle);
-  if (brakeTaskHandle  != NULL) vTaskResume(brakeTaskHandle);
+  // Release override lock so Core 0 lighting tasks resume cleanly
+  if (systemEventGroup != NULL) {
+    xEventGroupClearBits(systemEventGroup, BIT_LIGHTING_OVERRIDE);
+  }
 
   return true;
 }
@@ -412,8 +412,12 @@ void updateMPUTurnDetection(float correctedGyroZ, float dt) {
           (signalMode == CMD_RIGHT && accumulatedYaw <= -YAW_CANCEL_THRESHOLD)) {
         
         // EDGE PROTECTION: Update state trackers and dispatch cancellation tokens downstream
-        signalMode = CMD_TURN_OFF;
-        xQueueOverwrite(turnQueue, &signalMode); // Inform Core 0 to immediately drop flasher channels down to low potential
+        SignalCommand cancelCmd = CMD_TURN_OFF;
+        signalMode = cancelCmd;
+        xQueueOverwrite(turnQueue, &cancelCmd);       // Inform Core 0 to immediately drop flasher channels
+        if (turnCancelQueue != NULL) {
+          xQueueOverwrite(turnCancelQueue, &cancelCmd); // Keep Core 1 input handler cleanly synced
+        }
         
         Serial.print("[MPU] Turn auto-canceled. Net Yaw: ");
         Serial.print(accumulatedYaw, 2);

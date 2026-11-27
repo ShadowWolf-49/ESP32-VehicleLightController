@@ -87,6 +87,9 @@ float vehiclePitchRad            = 0.0;
 uint32_t lastUpdateTime          = 0;
 float filteredVehicleAccelY      = 0.0;
 
+// FreeRTOS Event Groups
+EventGroupHandle_t systemEventGroup = NULL;
+
 // FreeRTOS Queues
 QueueHandle_t brakeQueue         = NULL;
 QueueHandle_t turnQueue          = NULL;

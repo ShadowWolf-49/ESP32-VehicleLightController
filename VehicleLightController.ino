@@ -44,6 +44,7 @@ void setup() {
   initializeMPUCalibration();
 
   // --- 1. THREAD-SAFE CONCURRENCY LAYER CREATION ---
+  systemEventGroup   = xEventGroupCreate();
   brakeQueue         = xQueueCreate(1, sizeof(SignalCommand));
   turnQueue          = xQueueCreate(1, sizeof(SignalCommand));
   hazardQueue        = xQueueCreate(1, sizeof(SignalCommand));
@@ -96,19 +97,16 @@ void setup() {
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, HIGH);
 
-  // Start web server
-  startWebPortal();
-
   // --- 3. BACKGROUND MULTI-TASKING SCHEDULER LAUNCH ---
   xTaskCreatePinnedToCore(processVehicleTelemetry, "processVehicleTelemetry", 3072, NULL, 1, &telemetryHandle, 1);
   xTaskCreatePinnedToCore(mainInputProcessorTask, "mainInputTask", 2048, NULL, 2, &inputTaskHandle, 1);
   xTaskCreatePinnedToCore(turnSignalTask, "turnSignalTask", 1536, NULL, 1, &turnTaskHandle, 0);
-  xTaskCreatePinnedToCore(hazardTask, "hazardTask", 1536, NULL, 1, &hazardTaskHandle, 0);
-  xTaskCreatePinnedToCore(hornTask, "hornTask", 1536, NULL, 1, &hornTaskHandle, 0);
+  xTaskCreatePinnedToCore(hazardTask, "hazardTask", 2048, NULL, 1, &hazardTaskHandle, 0);
+  xTaskCreatePinnedToCore(hornTask, "hornTask", 2048, NULL, 1, &hornTaskHandle, 0);
   Serial.println("[SETUP] Horn relay task successfully pinned and launched on Core 0.");
 
   if (useBrakelights) {
-    xTaskCreatePinnedToCore(brakeLightTask, "brakeLightTask", 1536, NULL, 1, &brakeTaskHandle, 0);
+    xTaskCreatePinnedToCore(brakeLightTask, "brakeLightTask", 2048, NULL, 1, &brakeTaskHandle, 0);
     Serial.println("[SETUP] Brake light relay management task successfully pinned and launched on Core 0.");
   } else {
     Serial.println("[SETUP] Brake light relay management task disabled globally. Skipping runtime creation.");
@@ -128,6 +126,9 @@ void setup() {
     xTaskCreatePinnedToCore(processSystemInterlockSupervisor, "supervisorTask", 3072, NULL, 3, NULL, 1);
     Serial.println("[SETUP] Ignition Interlock Supervisor task pinned and launched on Core 1.");
   } else {
+
+    // Start web server
+    startWebPortal();
 
     // if not using IgnitionInterlock subscribe tasks to hardware watchdog
     if (telemetryHandle != NULL) esp_task_wdt_add(telemetryHandle);
